@@ -15,9 +15,14 @@ Tools:
 
   Editor:
     - connect              Connect to MeshSocket relay, get QR pairing payload
-    - push_layout          Send layout-update to paired device
+    - push_layout          Push a layout (routed w/ render echo, or broadcast)
     - save_layout          Send layout-save so device persists to disk
     - disconnect           Tear down MeshSocket connection
+
+  Read-back (see what's on the phone, instead of pushing blind):
+    - get_device_layout    Read the layout currently live on the device
+    - get_control_state    Read current control values on the device
+    - get_connection_status Read the device's relay connection status
 
   Device:
     - list_device_layouts  List all layout files on the paired device
@@ -356,6 +361,128 @@ antenna.radiowaves.left.and.right, hand.tap.fill, arrow.clockwise, star.fill, he
 """
 
 
+# ─── Read-back protocol (pure logic) ──────────────────────────────────────────
+#
+# Routed RPC over `route_msg` — the device answers these via handle(event:).
+# These helpers are pure (no I/O) so the protocol shapes and response formatting
+# are testable without a live device. The async tools below are thin wrappers.
+
+
+def format_routed_response(result, on_ok, verb: str) -> str:
+    """Render a routed-RPC reply, handling the three failure surfaces uniformly.
+
+    - None         → device did not answer within the relay timeout.
+    - {"error": …} → the relay could not route / errored.
+    - otherwise    → delegate to on_ok(result).
+    """
+    if result is None:
+        return f"Device did not respond to '{verb}' (timeout). Make sure it's paired and running."
+    if isinstance(result, dict) and "error" in result and not result.get("ok"):
+        return f"Relay error on '{verb}': {result['error']}"
+    return on_ok(result)
+
+
+def _format_summary(summary: dict) -> str:
+    """One structural-echo summary block → readable lines (tabs + controls)."""
+    lines = []
+    name = summary.get("name", "?")
+    accent = summary.get("accentColor")
+    lines.append(f"**{name}**" + (f" · accent {accent}" if accent else ""))
+    for tab in summary.get("tabs", []):
+        title = tab.get("title", "?")
+        icon = tab.get("icon", "")
+        lines.append(f"  Tab: {title}" + (f" ({icon})" if icon else ""))
+        for c in tab.get("controls", []):
+            pos = c.get("position")
+            span = c.get("span")
+            extras = []
+            if pos is not None:
+                extras.append(f"pos {pos}")
+            if span is not None and span != [1, 1]:
+                extras.append(f"span {span}")
+            suffix = f" — {', '.join(extras)}" if extras else ""
+            lines.append(f"    - {c.get('id','?')} ({c.get('type','?')}){suffix}")
+    return "\n".join(lines)
+
+
+# get-current-layout
+
+def build_get_layout_request(full: bool = False) -> dict:
+    return {"include": "full" if full else "summary"}
+
+
+def format_current_layout(resp: dict) -> str:
+    summary = resp.get("summary")
+    if not summary:
+        return "Device reports no layout loaded."
+    header_bits = []
+    if resp.get("activeFile"):
+        header_bits.append(f"file `{resp['activeFile']}`")
+    if resp.get("isLiveEditSession"):
+        header_bits.append("live-edit session")
+    header = (" · ".join(header_bits) + "\n") if header_bits else ""
+    body = _format_summary(summary)
+    full = resp.get("layout")
+    if full is not None:
+        body += "\n\n```json\n" + json.dumps(full, indent=2) + "\n```"
+    return header + body
+
+
+# get-control-state
+
+def build_control_state_request(ids=None):
+    if ids:
+        return {"ids": ids}
+    return None
+
+
+def format_control_state(resp: dict) -> str:
+    values = resp.get("values", {})
+    if not values:
+        return "Device reports no control values."
+    return "\n".join(f"- {k}: {json.dumps(v)}" for k, v in values.items())
+
+
+# get-connection-status
+
+def format_connection_status(resp: dict) -> str:
+    connected = resp.get("connected", False)
+    phase = resp.get("phase", "?")
+    state = "Connected" if connected else "Not connected"
+    lines = [f"{state} (phase: {phase})"]
+    if resp.get("channel"):
+        lines.append(f"  channel: {resp['channel']} · role: {resp.get('role','?')}")
+    if resp.get("account"):
+        lines.append(f"  account: {resp['account']}")
+    listening = resp.get("listening") or []
+    if listening:
+        lines.append(f"  listening: {', '.join(listening)}")
+    return "\n".join(lines)
+
+
+# apply-layout (truthful push)
+
+def build_apply_layout_request(layout: dict) -> dict:
+    """Routed apply-layout carries the layout itself, WITHOUT broadcast msg_type
+    framing (that belongs only to the broadcast layout-update path)."""
+    req = dict(layout)
+    req.pop("msg_type", None)
+    return req
+
+
+def format_apply_result(resp: dict) -> str:
+    if not resp.get("ok"):
+        return f"Device rejected the layout: {resp.get('error', 'unknown error')}"
+    rendered = resp.get("rendered", {})
+    return "Device rendered the layout:\n" + _format_summary(rendered)
+
+
+def should_push_routed(device_id) -> bool:
+    """Push truthfully (routed apply-layout, gets a rendered echo) when a single
+    device is resolvable; else broadcast layout-update to all viewers."""
+    return device_id is not None
+
+
 # ─── Editor Tools ─────────────────────────────────────────────────────────────
 
 @mcp.tool()
@@ -506,7 +633,12 @@ async def wait_for_device(timeout: int = 30) -> str:
 
 @mcp.tool()
 async def push_layout(layout_json: str) -> str:
-    """Push a layout update to the paired device. The device renders it immediately.
+    """Push a layout to the paired device. The device renders it immediately.
+
+    When a single device is paired, this pushes over routed RPC and reports back
+    exactly what the device rendered (or why it rejected the layout) — no more
+    blind "pushed successfully". With no resolvable device it falls back to a
+    broadcast so every paired viewer updates at once.
 
     Args:
         layout_json: Complete layout JSON string. Must be valid LayoutConfig.
@@ -524,8 +656,21 @@ async def push_layout(layout_json: str) -> str:
     if missing:
         return f"Layout missing required fields: {', '.join(missing)}"
 
-    layout["msg_type"] = "layout-update"
+    device_id = await _get_device_id()
 
+    if should_push_routed(device_id):
+        # Truthful push: the device applies the layout and echoes back what it
+        # actually rendered (or an error), so a broken layout can't masquerade
+        # as success.
+        result = await socket.request("route_msg", {
+            "target_id": device_id,
+            "type": "apply-layout",
+            "payload": build_apply_layout_request(layout),
+        }, timeout=5.0)
+        return format_routed_response(result, on_ok=format_apply_result, verb="apply-layout")
+
+    # No resolvable device — broadcast to all viewers (multi-viewer / demo path).
+    layout["msg_type"] = "layout-update"
     try:
         await socket.send("broadcast_request", layout)
         tab_count = len(layout.get("tabs", []))
@@ -533,7 +678,7 @@ async def push_layout(layout_json: str) -> str:
             len(tab.get("children", []))
             for tab in layout.get("tabs", [])
         )
-        return f"Layout pushed successfully. {tab_count} tabs, {control_count} top-level controls. Device should update live."
+        return f"Layout broadcast to all viewers. {tab_count} tabs, {control_count} top-level controls. (No single device paired, so no render confirmation.)"
     except ConnectionError:
         return "Failed to send — MeshSocket connection lost. Try reconnecting."
     except Exception as e:
@@ -578,6 +723,65 @@ async def _get_device_id() -> Optional[str]:
                 if c.get("name") != "carter-mcp-editor":
                     return c.get("id")
     return None
+
+
+async def _routed_request(verb: str, payload, on_ok):
+    """Resolve the paired device, send a routed `verb` request, and format the
+    reply via `format_routed_response` (handles not-connected / no-device /
+    timeout / relay-error uniformly). `on_ok(result)` renders a successful reply.
+    """
+    if not socket or not socket.is_running:
+        return "Not connected. Call connect first."
+    device_id = await _get_device_id()
+    if not device_id:
+        return "No device paired. Scan the QR code in CAR-TER first."
+    result = await socket.request("route_msg", {
+        "target_id": device_id,
+        "type": verb,
+        "payload": payload,
+    }, timeout=5.0)
+    return format_routed_response(result, on_ok=on_ok, verb=verb)
+
+
+@mcp.tool()
+async def get_device_layout(full: bool = False) -> str:
+    """Read the layout currently live on the paired device (structural summary).
+
+    Lets you SEE what's on the phone before editing, instead of pushing blind.
+
+    Args:
+        full: If true, also include the complete layout JSON (default: summary only).
+    """
+    return await _routed_request(
+        "get-current-layout",
+        build_get_layout_request(full=full),
+        on_ok=format_current_layout,
+    )
+
+
+@mcp.tool()
+async def get_control_state(ids: Optional[list[str]] = None) -> str:
+    """Read the current values of controls on the paired device.
+
+    Args:
+        ids: Optional list of control ids to filter to. Omit for all controls.
+    """
+    return await _routed_request(
+        "get-control-state",
+        build_control_state_request(ids),
+        on_ok=format_control_state,
+    )
+
+
+@mcp.tool()
+async def get_connection_status() -> str:
+    """Read the paired device's relay connection status — whether it's connected,
+    on which channel/account, and which events it's listening on."""
+    return await _routed_request(
+        "get-connection-status",
+        None,
+        on_ok=format_connection_status,
+    )
 
 
 @mcp.tool()
