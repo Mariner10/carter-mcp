@@ -27,10 +27,37 @@ Tools:
   Device:
     - list_device_layouts  List all layout files on the paired device
     - save_device_layout   Create or update a layout file on the device
+
+  Catalog & examples:
+    - get_control_catalog  Machine-readable schema for all controls (one call)
+    - list_control_examples / get_control_example   Documented example snippets
+
+  Incremental editing (working buffer — no more 800-line re-emits):
+    - begin_edit (blank / from_sample / from_device), preview_buffer, get_buffer_json
+    - add_control, insert_example, update_control, remove_control, move_control
+    - add_tab, add_group, show_grid, push_buffer, save_buffer, discard_buffer
+    - validate_layout / validate_buffer   Schema + grid lint before pushing
+    - snapshot_buffer / list_snapshots / revert_buffer   Experiment fearlessly
+
+  Human-in-the-loop & live service:
+    - customize_on_phone   Hand a control to the phone's configurator, read it back
+    - probe_service        Sniff live traffic → discovered events/paths
+    - autowire_buffer / lint_against_traffic   Bind/verify sync against real data
+    - simulate / set_control_value   Drive controls live (MCP-as-service)
+    - run_scenario         Scripted emit→assert UI testing over the mesh
+    - show_mesh_graph      Visualize the live MeshSocket roster
+    - say_in_chat / read_chat   LLM as a chat peer inside a layout
+
+  Generators:
+    - infer_layout         Real JSON payload → wired first-draft layout
+    - autotune_gauge       Gauge range + color zones from observed samples
+    - generate_theme / list_theme_vibes   Vibe/brand → ThemeConfig
+    - generate_service / generate_adapter  Runnable backend for a layout
 """
 
 import sys
 import os
+import copy
 import json
 import asyncio
 import glob
@@ -39,6 +66,21 @@ from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 import qrcode
+
+import autowire
+import catalog
+import chat
+import codegen
+import grid
+import meshgraph
+import qa
+import infer
+import probe
+import simulate as simulate_lib  # aliased: the `simulate` @mcp.tool() below shadows this module name
+import theming
+import tune
+import validate
+from buffer import LayoutBuffer, BufferError
 
 # MeshSocket library
 sys.path.insert(0, "/Users/carter/Desktop/Programming/MeshSocket/Python")
@@ -50,7 +92,7 @@ CONTROL_DOCS_DIR = PROJECT_ROOT / "CAR-TER" / "CAR-TER" / "ControlDocs"
 SAMPLE_LAYOUTS_DIR = PROJECT_ROOT / "CAR-TER" / "CAR-TER" / "SampleLayouts"
 DOCS_DIR = PROJECT_ROOT / "CAR-TER" / "docs"
 
-RELAY_URL = "wss://carterbeaudoin.com/coms/"
+RELAY_URL = os.environ.get("CARTER_RELAY_URL", "wss://carterbeaudoin.com/coms/")
 RELAY_TOKEN = os.environ.get("CARTER_MESH_TOKEN", "")
 
 # ─── QR helpers ──────────────────────────────────────────────────────────────
@@ -72,6 +114,32 @@ socket_task: Optional[asyncio.Task] = None
 current_channel: Optional[str] = None
 peer_list: list[dict] = []
 device_connected_event: Optional[asyncio.Event] = None
+# The server-held draft for incremental editing (begin_edit / add_control / …).
+# Persists across tool calls within a session; pushed to the device as a full layout.
+work_buffer: Optional[LayoutBuffer] = None
+# Resolved by the `control-edit-response` listener when the user taps "Send to
+# Editor" on the phone's configurator (the customize_on_phone round-trip).
+control_edit_future: Optional[asyncio.Future] = None
+# Aggregated traffic schema from the last probe_service run (event -> path -> stats),
+# consumed by autowire_buffer / lint_against_traffic.
+last_probe_events: dict = {}
+# Saved buffer states for snapshot / revert (experiment fearlessly).
+buffer_snapshots: list[tuple[str, dict]] = []
+# Active session connection target, set by connect(); lets the relay URL/token be
+# overridden per call (the relay URL can change) instead of being hardcoded.
+# show_qr reads these so the device pairs to the exact relay the editor used.
+active_url: Optional[str] = None
+active_token: Optional[str] = None
+# What the *device* scans. For the local relay this is the Mac's LAN IP (the
+# editor itself dials loopback), so the two can differ.
+active_qr_url: Optional[str] = None
+# Zero-config authoring transport: an in-process, auth-free MeshSocket relay.
+local_relay = None
+local_relay_task: Optional[asyncio.Task] = None
+LOCAL_RELAY_PORT = int(os.environ.get("CARTER_LOCAL_RELAY_PORT", "8765"))
+# Optional dev-validator base URL, used only by the gateway path to auto-mint a
+# token so authoring never needs a hand-pasted one.
+VALIDATOR_URL = os.environ.get("CARTER_VALIDATOR_URL", "")
 
 # ─── MCP Server ───────────────────────────────────────────────────────────────
 
@@ -361,6 +429,67 @@ antenna.radiowaves.left.and.right, hand.tap.fill, arrow.clockwise, star.fill, he
 """
 
 
+@mcp.tool()
+def get_control_catalog(types: Optional[list[str]] = None,
+                        include_theme: bool = False) -> str:
+    """Machine-readable schema for every placeable control, in ONE call.
+
+    Returns compact JSON keyed by control `type` (the value used in a layout), each
+    with its fields (name/type/enum values/default), defaultSpan, and example names.
+    Prefer this over reading individual control docs when authoring — it's the whole
+    control vocabulary at once.
+
+    Args:
+        types: Optional list of control types/node-ids to filter to (e.g. ['gauge','button']).
+        include_theme: Also include each control's per-control theme override fields.
+    """
+    cat = catalog.build_catalog(CONTROL_DOCS_DIR, types=types, include_theme=include_theme)
+    if not cat:
+        return (f"No controls matched {types}." if types else "No controls found.")
+    return json.dumps(cat, indent=2)
+
+
+@mcp.tool()
+def list_control_examples(control_id: str) -> str:
+    """List the named example snippets available in a control's documentation.
+
+    Use get_control_example to fetch one as a ready-to-tweak config.
+
+    Args:
+        control_id: Control type or doc node-id (e.g. 'gauge', 'color-picker').
+    """
+    examples = catalog.get_examples(CONTROL_DOCS_DIR, control_id)
+    if not examples:
+        return f"No examples found for '{control_id}'. Try list_controls or get_control_doc."
+    lines = [f"Examples for `{control_id}`:"]
+    lines += [f"  - {e['name']}" for e in examples]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_control_example(control_id: str, name: str = "") -> str:
+    """Get a ready-to-customize JSON config for a documented control example.
+
+    Copy it, tweak the fields, then place it into a layout (or use insert_example to
+    drop it straight into the working buffer with a fresh id + free grid slot).
+
+    Args:
+        control_id: Control type or doc node-id (e.g. 'button', 'gauge').
+        name: Example name (prefix match, case-insensitive). Omit for the first example.
+    """
+    examples = catalog.get_examples(CONTROL_DOCS_DIR, control_id)
+    if not examples:
+        return f"No examples found for '{control_id}'."
+    if not name:
+        ex = examples[0]
+    else:
+        ex = catalog.find_example(CONTROL_DOCS_DIR, control_id, name)
+        if not ex:
+            avail = ", ".join(e["name"] for e in examples)
+            return f"No example '{name}' for '{control_id}'. Available: {avail}"
+    return f"**{ex['name']}**\n\n```json\n{ex['json']}\n```"
+
+
 # ─── Read-back protocol (pure logic) ──────────────────────────────────────────
 #
 # Routed RPC over `route_msg` — the device answers these via handle(event:).
@@ -483,31 +612,159 @@ def should_push_routed(device_id) -> bool:
     return device_id is not None
 
 
+# ─── Control-edit handoff (pure logic) ───────────────────────────────────────
+#
+# "Shape it on glass": push a control to the phone's configurator, the user tweaks
+# it by hand, taps "Send to Editor", and the edited control comes back. Wire contract
+# in PROTOCOL.md (control-edit-request / control-edit-response).
+
+
+def build_control_edit_request(control: dict) -> dict:
+    """Frame a control for the phone's configurator (broadcast layout-edit message)."""
+    return {"msg_type": "control-edit-request", "control": control}
+
+
+def extract_edited_control(payload) -> Optional[dict]:
+    """Pull the user-edited control out of a control-edit-response payload. Accepts
+    either the wrapper ({msg_type, control}) or a bare control object."""
+    if not isinstance(payload, dict):
+        return None
+    inner = payload.get("control")
+    if isinstance(inner, dict):
+        return inner
+    if "type" in payload:  # already the bare control
+        return {k: v for k, v in payload.items() if k != "msg_type"}
+    return None
+
+
+# ─── Connection helpers (local relay + token mint) ───────────────────────────
+
+def _lan_ip() -> str:
+    """Best-effort primary LAN IP of this Mac, for the device's QR (the phone
+    dials over Wi-Fi, not loopback). Falls back to 127.0.0.1."""
+    import socket as _s
+    sock = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        sock.close()
+
+
+async def _ensure_local_relay() -> int:
+    """Start an in-process, auth-free MeshSocket relay once; return its port.
+    The zero-config authoring transport — no gateway, no token, no AWS."""
+    global local_relay, local_relay_task
+    if local_relay is not None and local_relay_task and not local_relay_task.done():
+        return LOCAL_RELAY_PORT
+    from socket_server import MeshServer
+    ready = asyncio.Event()
+    local_relay = MeshServer(
+        host="0.0.0.0",
+        port=LOCAL_RELAY_PORT,
+        auth_handler=lambda token, ip: True,  # authoring relay accepts any pairing
+        on_startup=ready.set,
+    )
+    local_relay_task = asyncio.create_task(local_relay.start())
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        pass
+    await asyncio.sleep(0.3)  # on_startup fires just before serve() binds the port
+    return LOCAL_RELAY_PORT
+
+
+async def _mint_token(validator_url: str, account: str, product: str) -> str:
+    """Mint a short-lived token from the dev validator (POST /validate), so the
+    gateway path needs no hand-pasted token. Dev validator trusts the claims."""
+    import urllib.request
+    import time
+    body = json.dumps({
+        "account": account,
+        "product": product,
+        "expiresAtMs": int((time.time() + 3600) * 1000),
+    }).encode()
+    req = urllib.request.Request(
+        validator_url.rstrip("/") + "/validate",
+        data=body, headers={"Content-Type": "application/json"}, method="POST",
+    )
+
+    def _do():
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+
+    data = await asyncio.to_thread(_do)
+    tok = data.get("token")
+    if not tok:
+        raise RuntimeError(f"validator returned no token: {data}")
+    return tok
+
+
 # ─── Editor Tools ─────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def connect(channel: str = "editor", role: str = "editor") -> str:
-    """Connect to the MeshSocket relay as a layout editor.
+async def connect(channel: str = "editor", role: str = "editor",
+                  target: str = "local", url: str = "", token: str = "",
+                  validator_url: str = "") -> str:
+    """Pair a device for live layout authoring. Hassle-free by default.
 
-    After connecting, the user needs to scan the returned QR payload on their
-    device to pair. Then you can push layouts that update live on the device.
+    target="local" (default): spins up an in-process, auth-free MeshSocket relay
+    on this Mac and builds a QR with the LAN IP — no gateway, no token, no AWS.
+    Just have the phone on the same Wi-Fi (the app allows ws:// on the LAN).
+
+    target="relay": use the Connect+ gateway instead (phone can be on any
+    network, wss). The token is taken from `token` / CARTER_MESH_TOKEN, or
+    auto-minted from the dev validator (`validator_url` / CARTER_VALIDATOR_URL)
+    so you still don't hand-paste one.
 
     Args:
-        channel: MeshSocket channel name (default: 'editor')
-        role: MeshSocket role (default: 'editor')
+        channel: MeshSocket channel name (default 'editor').
+        role: MeshSocket role for the editor (default 'editor').
+        target: 'local' (default, zero-config) or 'relay' (gateway).
+        url: gateway ws/wss URL (target='relay' only); else CARTER_RELAY_URL/default.
+        token: gateway token (target='relay' only); else env, else auto-mint.
+        validator_url: dev-validator base URL to mint a token from (target='relay').
     """
     global socket, socket_task, current_channel, device_connected_event
+    global active_url, active_token, active_qr_url
 
     if socket and socket.is_running:
         return f"Already connected on channel '{current_channel}'. Call disconnect first to reconnect."
 
+    if target == "local":
+        port = await _ensure_local_relay()
+        lan = _lan_ip()
+        active_url = f"ws://127.0.0.1:{port}"      # editor dials loopback
+        active_qr_url = f"ws://{lan}:{port}"        # phone dials the Mac over Wi-Fi
+        active_token = ""
+        transport_note = (f"local relay at {active_qr_url} — no gateway, no token "
+                          f"(phone must share this Wi-Fi)")
+    else:
+        active_url = url or RELAY_URL
+        active_qr_url = active_url
+        active_token = token or RELAY_TOKEN
+        if not active_token:
+            vurl = validator_url or VALIDATOR_URL
+            if not vurl:
+                return ("Gateway target needs a token: pass token=… or set "
+                        "CARTER_VALIDATOR_URL (validator_url=…) so I can auto-mint one.")
+            try:
+                active_token = await _mint_token(vurl, f"mcp-{os.urandom(4).hex()}",
+                                                 "CARTER.connectplus.duo")
+            except Exception as e:
+                return f"Failed to auto-mint a token from {vurl}: {e}"
+            transport_note = f"gateway {active_url} (auto-minted token)"
+        else:
+            transport_note = f"gateway {active_url}"
     current_channel = channel
     device_connected_event = asyncio.Event()
 
     socket = MeshSocket(
-        url=RELAY_URL,
+        url=active_url,
         name="carter-mcp-editor",
-        auth_token=RELAY_TOKEN,
+        auth_token=active_token,
         channel=channel,
         role=role,
         can_broadcast=True,
@@ -523,6 +780,12 @@ async def connect(channel: str = "editor", role: str = "editor") -> str:
         if peer_list:
             device_connected_event.set()
 
+    @socket.on("control-edit-response")
+    async def _on_control_edit_response(payload):
+        # The phone tapped "Send to Editor" in the configurator (customize_on_phone).
+        if control_edit_future and not control_edit_future.done():
+            control_edit_future.set_result(payload)
+
     socket_task = asyncio.create_task(_run_socket())
 
     try:
@@ -532,18 +795,17 @@ async def connect(channel: str = "editor", role: str = "editor") -> str:
         return "Failed to connect to MeshSocket relay within 10 seconds."
 
     qr_payload = json.dumps({
-        "url": RELAY_URL,
-        "token": RELAY_TOKEN,
+        "url": active_qr_url,
+        "token": active_token,
         "channel": channel,
         "role": "viewer",
     })
 
     qr_path = _make_qr_image(qr_payload)
 
-    return f"""Connected to MeshSocket relay on channel '{channel}'.
-
-QR code saved to: {qr_path}
-Open that image and scan it in CAR-TER to pair.
+    return f"""Connected — {transport_note}.
+Channel '{channel}'. QR saved to: {qr_path}
+Scan it in CAR-TER to pair.
 
 Pairing payload (manual entry):
 
@@ -593,8 +855,8 @@ async def show_qr() -> str:
         return "Not connected. Call connect first."
 
     qr_payload = json.dumps({
-        "url": RELAY_URL,
-        "token": RELAY_TOKEN,
+        "url": active_qr_url or RELAY_URL,
+        "token": active_token or "",
         "channel": current_channel,
         "role": "viewer",
     })
@@ -619,16 +881,59 @@ async def wait_for_device(timeout: int = 30) -> str:
     if not socket or not socket.is_running:
         return "Not connected. Call connect first."
 
-    if peer_list:
-        names = ", ".join(p.get("name", "unknown") for p in peer_list)
-        return f"Device already paired: {names}"
+    # Poll the roster rather than wait on the identify push: the relay registers a
+    # client into self.clients only AFTER broadcasting the roster, so a later joiner
+    # (the device — the editor always connects first) is never pushed. `get_nodes`
+    # reads the live roster at request time, by which point the device is registered.
+    deadline = asyncio.get_event_loop().time() + max(1, timeout)
+    while True:
+        peers = await _poll_peers()
+        if peers:
+            names = ", ".join(p.get("name", "unknown") for p in peers)
+            return f"Device paired: {names}"
+        if asyncio.get_event_loop().time() >= deadline:
+            return f"No device connected within {timeout}s. Make sure to scan the QR code in CAR-TER."
+        await asyncio.sleep(1.0)
 
+
+async def _apply_or_broadcast(layout: dict) -> str:
+    """Send a layout to the device truthfully when a single device is resolvable
+    (routed apply-layout with a rendered echo), else broadcast to all viewers.
+    Shared by push_layout and push_buffer."""
+    device_id = await _get_device_id()
+    if should_push_routed(device_id):
+        result = await socket.request("route_msg", {
+            "target_id": device_id,
+            "type": "apply-layout",
+            "payload": build_apply_layout_request(layout),
+        }, timeout=5.0)
+        return format_routed_response(result, on_ok=format_apply_result, verb="apply-layout")
+
+    payload = dict(layout)
+    payload["msg_type"] = "layout-update"
     try:
-        await asyncio.wait_for(device_connected_event.wait(), timeout=timeout)
-        names = ", ".join(p.get("name", "unknown") for p in peer_list)
-        return f"Device paired: {names}"
-    except asyncio.TimeoutError:
-        return f"No device connected within {timeout}s. Make sure to scan the QR code in CAR-TER."
+        await socket.send("broadcast_request", payload)
+        tab_count = len(layout.get("tabs", []))
+        control_count = sum(len(tab.get("children", [])) for tab in layout.get("tabs", []))
+        return (f"Layout broadcast to all viewers. {tab_count} tabs, {control_count} "
+                f"top-level controls. (No single device paired, so no render confirmation.)")
+    except ConnectionError:
+        return "Failed to send — MeshSocket connection lost. Try reconnecting."
+    except Exception as e:
+        return f"Failed to push layout: {e}"
+
+
+async def _save_layout_obj(layout: dict) -> str:
+    """Broadcast a layout-save so the device persists the layout to disk."""
+    payload = dict(layout)
+    payload["msg_type"] = "layout-save"
+    try:
+        await socket.send("broadcast_request", payload)
+        return f"Save request sent. Device will persist '{layout.get('name', 'Untitled')}' to disk."
+    except ConnectionError:
+        return "Failed to send — MeshSocket connection lost."
+    except Exception as e:
+        return f"Failed to save layout: {e}"
 
 
 @mcp.tool()
@@ -656,33 +961,7 @@ async def push_layout(layout_json: str) -> str:
     if missing:
         return f"Layout missing required fields: {', '.join(missing)}"
 
-    device_id = await _get_device_id()
-
-    if should_push_routed(device_id):
-        # Truthful push: the device applies the layout and echoes back what it
-        # actually rendered (or an error), so a broken layout can't masquerade
-        # as success.
-        result = await socket.request("route_msg", {
-            "target_id": device_id,
-            "type": "apply-layout",
-            "payload": build_apply_layout_request(layout),
-        }, timeout=5.0)
-        return format_routed_response(result, on_ok=format_apply_result, verb="apply-layout")
-
-    # No resolvable device — broadcast to all viewers (multi-viewer / demo path).
-    layout["msg_type"] = "layout-update"
-    try:
-        await socket.send("broadcast_request", layout)
-        tab_count = len(layout.get("tabs", []))
-        control_count = sum(
-            len(tab.get("children", []))
-            for tab in layout.get("tabs", [])
-        )
-        return f"Layout broadcast to all viewers. {tab_count} tabs, {control_count} top-level controls. (No single device paired, so no render confirmation.)"
-    except ConnectionError:
-        return "Failed to send — MeshSocket connection lost. Try reconnecting."
-    except Exception as e:
-        return f"Failed to push layout: {e}"
+    return await _apply_or_broadcast(layout)
 
 
 @mcp.tool()
@@ -700,15 +979,888 @@ async def save_layout(layout_json: str) -> str:
     except json.JSONDecodeError as e:
         return f"Invalid JSON: {e}"
 
-    layout["msg_type"] = "layout-save"
+    return await _save_layout_obj(layout)
 
+
+# ─── Buffer (incremental editing) Tools ──────────────────────────────────────
+#
+# A server-held working draft so the LLM edits surgically (add one control, tweak
+# one field) instead of re-emitting the whole layout. Each op mutates `work_buffer`;
+# push_buffer sends the full result to the device (which already renders full layouts).
+
+_catalog_cache: dict[bool, dict] = {}
+
+
+def _catalog(include_theme: bool = False) -> dict:
+    if include_theme not in _catalog_cache:
+        _catalog_cache[include_theme] = catalog.build_catalog(
+            CONTROL_DOCS_DIR, include_theme=include_theme)
+    return _catalog_cache[include_theme]
+
+
+def _default_span_for(control_type: str) -> Optional[list[int]]:
+    entry = _catalog().get(control_type)
+    return entry.get("defaultSpan") if entry else None
+
+
+async def _fetch_device_layout_obj() -> Optional[dict]:
+    """Pull the device's live layout (full) as a raw dict, for begin_edit(from_device)."""
+    device_id = await _get_device_id()
+    if not device_id:
+        return None
+    result = await socket.request("route_msg", {
+        "target_id": device_id,
+        "type": "get-current-layout",
+        "payload": {"include": "full"},
+    }, timeout=5.0)
+    if isinstance(result, dict):
+        return result.get("layout")
+    return None
+
+
+async def _persist_layout_obj(layout: dict, filename: str = "") -> str:
+    """Persist a layout to the device's disk — routed save-layout (with a file name
+    and an ok/file reply) when a device is resolvable, else a broadcast layout-save."""
+    device_id = await _get_device_id()
+    if device_id:
+        payload: dict = {"layout": layout}
+        if filename:
+            payload["file"] = filename
+        result = await socket.request("route_msg", {
+            "target_id": device_id, "type": "save-layout", "payload": payload,
+        }, timeout=5.0)
+        if result is None:
+            return "Device did not respond to save (timeout)."
+        if isinstance(result, dict) and result.get("ok"):
+            return f"Saved on device as `{result.get('file', '?')}`."
+        if isinstance(result, dict) and "error" in result:
+            return f"Save error: {result['error']}"
+        return f"Unexpected save response: {result}"
+    return await _save_layout_obj(layout)
+
+
+@mcp.tool()
+async def begin_edit(name: str = "Untitled", columns: int = 4, rows: int = 8,
+                     accent: str = "#667eea", from_sample: str = "",
+                     from_device: bool = False) -> str:
+    """Start (or restart) the working layout buffer for incremental editing.
+
+    Then use add_control / insert_example / update_control / move_control / etc. to
+    edit surgically, preview_buffer to see it, and push_buffer to send it live —
+    without ever re-emitting the whole layout.
+
+    Args:
+        name: Layout name (blank-buffer mode).
+        columns, rows: Grid of the first tab (blank-buffer mode).
+        accent: Accent color hex (blank-buffer mode).
+        from_sample: Seed from a sample layout filename (e.g. 'demo-offline.json').
+        from_device: Seed from the layout currently live on the paired device (read-modify-write).
+    """
+    global work_buffer
+    if from_device:
+        if not socket or not socket.is_running:
+            return "Not connected — can't read the device. Call connect first (or omit from_device)."
+        layout = await _fetch_device_layout_obj()
+        if not layout:
+            return "Couldn't read a layout off the device (none loaded, or it didn't respond)."
+        try:
+            work_buffer = LayoutBuffer.from_layout(layout)
+        except BufferError as e:
+            return f"Device layout couldn't be loaded into the buffer: {e}"
+        return "Buffer seeded from the live device layout.\n\n" + work_buffer.summary()
+    if from_sample:
+        fname = from_sample if from_sample.endswith(".json") else from_sample + ".json"
+        path = SAMPLE_LAYOUTS_DIR / fname
+        if not path.exists():
+            avail = ", ".join(f.name for f in SAMPLE_LAYOUTS_DIR.glob("*.json"))
+            return f"Sample '{fname}' not found. Available: {avail}"
+        try:
+            work_buffer = LayoutBuffer.from_layout(json.loads(path.read_text()))
+        except (json.JSONDecodeError, BufferError) as e:
+            return f"Couldn't load sample: {e}"
+        return f"Buffer seeded from {fname}.\n\n" + work_buffer.summary()
+    work_buffer = LayoutBuffer.blank(name=name, columns=columns, rows=rows, accent=accent)
+    return f"New blank buffer '{name}' ({rows}x{columns}).\n\n" + work_buffer.summary()
+
+
+@mcp.tool()
+def preview_buffer(show_grids: bool = True) -> str:
+    """Show the current working buffer: structure, per-tab grid maps, and any
+    placement issues. Never re-dumps the whole JSON (use get_buffer_json for that)."""
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    return work_buffer.summary(show_grids=show_grids)
+
+
+@mcp.tool()
+def get_buffer_json() -> str:
+    """Return the full JSON of the working buffer (for inspection or manual save)."""
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    return json.dumps(work_buffer.layout, indent=2)
+
+
+@mcp.tool()
+def add_control(control_json: str, tab_index: int = 0,
+                position: Optional[list[int]] = None) -> str:
+    """Add one control to the buffer. Auto-assigns a unique id and (if no position
+    is given) the next free grid slot honoring the control's default span.
+
+    Args:
+        control_json: A single control object, e.g. {"type":"gauge","label":"Battery"}.
+        tab_index: Which tab to add to (default 0).
+        position: Optional [row, col]; omit to auto-place.
+    """
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
     try:
-        await socket.send("broadcast_request", layout)
-        return f"Layout save request sent. Device will persist '{layout.get('name', 'Untitled')}' to disk."
-    except ConnectionError:
-        return "Failed to send — MeshSocket connection lost."
+        control = json.loads(control_json)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    if not isinstance(control, dict) or "type" not in control:
+        return "control_json must be an object with a 'type'."
+    try:
+        added = work_buffer.add_control(
+            control, tab_index=tab_index, position=position,
+            default_span=_default_span_for(control.get("type")))
+    except BufferError as e:
+        return f"Couldn't add control: {e}"
+    span = f" span {added['span']}" if added.get("span") else ""
+    return f"Added {added['id']} ({added['type']}) at {added['position']}{span} on tab {tab_index}."
+
+
+@mcp.tool()
+def insert_example(control_id: str, name: str = "", tab_index: int = 0,
+                   position: Optional[list[int]] = None) -> str:
+    """Drop a documented control example straight into the buffer, with a fresh id
+    and a free grid slot. Browse with list_control_examples, then place one here.
+
+    Args:
+        control_id: Control type or doc node-id (e.g. 'gauge').
+        name: Example name (prefix match); omit for the first example.
+        tab_index: Which tab to add to.
+        position: Optional [row, col]; omit to auto-place.
+    """
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    ex = catalog.find_example(CONTROL_DOCS_DIR, control_id, name) if name \
+        else (catalog.get_examples(CONTROL_DOCS_DIR, control_id) or [None])[0]
+    if not ex:
+        return f"No matching example for '{control_id}'. Try list_control_examples."
+    obj = catalog.example_as_obj(ex)
+    if not obj:
+        return f"Example '{ex['name']}' didn't parse as a control object."
+    try:
+        added = work_buffer.add_control(
+            obj, tab_index=tab_index, position=position,
+            default_span=_default_span_for(obj.get("type")))
+    except BufferError as e:
+        return f"Couldn't insert example: {e}"
+    return f"Inserted '{ex['name']}' as {added['id']} at {added['position']} on tab {tab_index}."
+
+
+@mcp.tool()
+def update_control(control_id: str, patch_json: str) -> str:
+    """Merge fields into an existing control. Set a field to null to remove it.
+
+    Args:
+        control_id: id of the control to edit.
+        patch_json: Object of fields to merge, e.g. {"tint":"#FF0000","style":"ghost"}.
+    """
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    try:
+        patch = json.loads(patch_json)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    if not isinstance(patch, dict):
+        return "patch_json must be an object."
+    try:
+        work_buffer.update_control(control_id, patch)
+    except BufferError as e:
+        return f"Couldn't update: {e}"
+    return f"Updated {control_id}: {', '.join(patch.keys())}."
+
+
+@mcp.tool()
+def remove_control(control_id: str) -> str:
+    """Remove a control from the buffer by id."""
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    try:
+        work_buffer.remove_control(control_id)
+    except BufferError as e:
+        return f"Couldn't remove: {e}"
+    return f"Removed {control_id}."
+
+
+@mcp.tool()
+def move_control(control_id: str, position: Optional[list[int]] = None,
+                 span: Optional[list[int]] = None,
+                 tab_index: Optional[int] = None) -> str:
+    """Reposition / resize a control, or move it to another tab.
+
+    Args:
+        control_id: id of the control.
+        position: New [row, col].
+        span: New [rowSpan, colSpan].
+        tab_index: Move to this tab index.
+    """
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    try:
+        ch = work_buffer.move_control(control_id, position=position, span=span, tab_index=tab_index)
+    except BufferError as e:
+        return f"Couldn't move: {e}"
+    return f"Moved {control_id} → position {ch.get('position')} span {ch.get('span', [1, 1])}."
+
+
+@mcp.tool()
+def add_tab(title: str, icon: str = "square.grid.2x2",
+            columns: int = 4, rows: int = 8) -> str:
+    """Add a tab to the buffer. Returns its index."""
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    idx = work_buffer.add_tab(title, icon=icon, columns=columns, rows=rows)
+    return f"Added tab {idx}: '{title}' ({rows}x{columns})."
+
+
+@mcp.tool()
+def add_group(group_json: str, tab_index: int = 0,
+              position: Optional[list[int]] = None) -> str:
+    """Add a group container to the buffer (auto-placed unless position given).
+
+    Args:
+        group_json: A group object, e.g. {"label":"Lights","grid":{"columns":2,"rows":2},"children":[...]}.
+        tab_index: Which tab to add to.
+        position: Optional [row, col].
+    """
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    try:
+        group = json.loads(group_json)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    if not isinstance(group, dict):
+        return "group_json must be an object."
+    try:
+        added = work_buffer.add_group(group, tab_index=tab_index, position=position)
+    except BufferError as e:
+        return f"Couldn't add group: {e}"
+    return f"Added group {added['id']} at {added['position']} on tab {tab_index}."
+
+
+@mcp.tool()
+def show_grid(tab_index: int = 0) -> str:
+    """ASCII occupancy map of a tab's grid — which cells are filled (by which
+    control) and which are free. 'See' the layout spatially before editing."""
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    try:
+        tab = work_buffer._tab(tab_index)
+    except BufferError as e:
+        return str(e)
+    cols, rows = LayoutBuffer._grid_dims(tab)
+    return (f"Tab {tab_index}: {tab.get('title', '?')} ({rows}x{cols})\n"
+            + grid.render_grid(tab.get("children", []), cols, rows))
+
+
+@mcp.tool()
+async def push_buffer() -> str:
+    """Push the working buffer to the paired device (truthful apply with a rendered
+    echo when a single device is paired). Edits stay in the buffer for further work."""
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    if not socket or not socket.is_running:
+        return "Not connected. Call connect first."
+    return await _apply_or_broadcast(work_buffer.layout)
+
+
+@mcp.tool()
+async def save_buffer(filename: str = "") -> str:
+    """Push the working buffer AND tell the device to persist it to disk.
+
+    Args:
+        filename: Optional filename (derived from the layout name if omitted).
+    """
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    if not socket or not socket.is_running:
+        return "Not connected. Call connect first."
+    return await _persist_layout_obj(work_buffer.layout, filename=filename)
+
+
+@mcp.tool()
+def discard_buffer() -> str:
+    """Discard the working buffer without sending anything."""
+    global work_buffer
+    if work_buffer is None:
+        return "No active buffer."
+    work_buffer = None
+    return "Buffer discarded."
+
+
+@mcp.tool()
+def validate_layout(layout_json: str) -> str:
+    """Lint a layout against the control schema WITHOUT pushing it: duplicate ids,
+    unknown control types, unknown/bad-enum fields, and grid overlaps/out-of-bounds.
+
+    Args:
+        layout_json: Complete layout JSON string.
+    """
+    try:
+        layout = json.loads(layout_json)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    return validate.format_findings(validate.validate_layout(layout, _catalog(include_theme=True)))
+
+
+@mcp.tool()
+def validate_buffer() -> str:
+    """Lint the working buffer against the control schema (same checks as
+    validate_layout) before you push or save it."""
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    return validate.format_findings(
+        validate.validate_layout(work_buffer.layout, _catalog(include_theme=True)))
+
+
+@mcp.tool()
+async def customize_on_phone(control_json: str, timeout: int = 120,
+                             add_to_buffer: bool = False, tab_index: int = 0) -> str:
+    """Hand a control to the phone's on-screen configurator so the USER customizes it
+    by hand (live preview + field editor), then read back exactly what they shaped.
+
+    "Shape it on glass, wire it on the model": the human does the look/feel, you do the
+    plumbing. The user taps "Send to Editor" on the phone to return the control.
+    Requires a paired device in a live-edit session (connect + scan QR).
+
+    Args:
+        control_json: The control to hand off (e.g. {"type":"gauge","label":"Battery"}).
+        timeout: Seconds to wait for the user to finish (default 120).
+        add_to_buffer: If true, drop the returned control into the working buffer.
+        tab_index: Tab to add to when add_to_buffer is set.
+    """
+    if not socket or not socket.is_running:
+        return "Not connected. Call connect first."
+    try:
+        control = json.loads(control_json)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    if not isinstance(control, dict) or "type" not in control:
+        return "control_json must be an object with a 'type'."
+    control.setdefault("id", control["type"])
+
+    # Open the configurator on the phone — editor → device works via broadcast.
+    try:
+        await socket.send("broadcast_request", build_control_edit_request(control))
     except Exception as e:
-        return f"Failed to save layout: {e}"
+        return f"Failed to open the configurator on the phone: {e}"
+
+    # The live-edit viewer can't broadcast/route, so it can't push the shaped control
+    # back. Poll the device's routed `get-pending-edit` until the user taps "Send to
+    # Editor" (mirrors wait_for_device's get_nodes poll). The configurator stashes the
+    # result device-side; this routed read drains it.
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max(1, timeout)
+    edited = None
+    while loop.time() < deadline:
+        device_id = await _get_device_id()
+        if device_id:
+            result = await socket.request("route_msg", {
+                "target_id": device_id,
+                "type": "get-pending-edit",
+                "payload": {},
+            }, timeout=5.0)
+            if isinstance(result, dict) and isinstance(result.get("control"), dict):
+                edited = extract_edited_control(result)
+                if edited:
+                    break
+        await asyncio.sleep(1.0)
+
+    if not edited:
+        return (f"No response within {timeout}s — the configurator may not have opened "
+                f"(is the device in a live-edit session?) or the user didn't tap 'Send to Editor'.")
+
+    pretty = json.dumps(edited, indent=2)
+    if add_to_buffer:
+        if work_buffer is None:
+            return ("User-shaped control received, but there's no active buffer to add it to "
+                    f"(call begin_edit). Control:\n```json\n{pretty}\n```")
+        try:
+            added = work_buffer.add_control(
+                edited, tab_index=tab_index,
+                default_span=_default_span_for(edited.get("type")))
+        except BufferError as e:
+            return f"Received the control but couldn't add it: {e}\n```json\n{pretty}\n```"
+        return (f"User-shaped control added as {added['id']} at {added['position']} on tab "
+                f"{tab_index}.\n```json\n{pretty}\n```")
+    return f"User-shaped control received:\n```json\n{pretty}\n```"
+
+
+@mcp.tool()
+def infer_layout(payload_json: str, name: str = "Inferred", event: str = "telemetry",
+                 columns: int = 4, rows: int = 8, into_buffer: bool = True) -> str:
+    """Infer a wired first-draft layout from a real JSON payload (paste a sample from
+    your service, or use probe_service to capture one). Numbers→gauges, 0..1→progress
+    rings, bools→toggles, lat/lng→map, arrays→sparklines/cardlists, strings→labels —
+    each bound to the right nested valuePath.
+
+    Args:
+        payload_json: A sample JSON object emitted by your service.
+        name: Layout name.
+        event: The mesh event the controls should listen on (default 'telemetry').
+        columns, rows: Grid of the inferred tab.
+        into_buffer: Load the result into the working buffer for further editing (default).
+    """
+    global work_buffer
+    try:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    if not isinstance(payload, dict):
+        return "payload_json must be a JSON object."
+    layout = infer.build_layout(payload, name=name, event=event, columns=columns,
+                                rows=rows, default_span_fn=_default_span_for)
+    if into_buffer:
+        work_buffer = LayoutBuffer.from_layout(layout)
+        return ("Inferred layout loaded into the buffer (edit, then push_buffer):\n\n"
+                + work_buffer.summary())
+    return json.dumps(layout, indent=2)
+
+
+@mcp.tool()
+def autotune_gauge(control_id: str, samples_json: str, field_name: str = "") -> str:
+    """Tune a buffer gauge from observed samples: sets min/max and color zones at the
+    data's percentiles, oriented by whether higher is better (battery) or worse (temp),
+    inferred from the field name.
+
+    Args:
+        control_id: id of a gauge in the working buffer.
+        samples_json: JSON array of numeric samples, e.g. [40,52,61,73,95].
+        field_name: Metric name for unit/direction hints (defaults to the id).
+    """
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    try:
+        samples = json.loads(samples_json)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    if not isinstance(samples, list) or not samples:
+        return "samples_json must be a non-empty array of numbers."
+    found = work_buffer.find(control_id)
+    if not found:
+        return f"No control '{control_id}' in the buffer."
+    ch = found[2]
+    if ch.get("type") != "gauge":
+        return f"'{control_id}' is a {ch.get('type')}, not a gauge."
+    patch = tune.tune_gauge(ch, samples, field_name=field_name or control_id)
+    work_buffer.update_control(control_id, patch)
+    unit = tune.infer_unit(field_name or control_id)
+    return (f"Tuned {control_id}: min {patch['min']}, max {patch['max']}, "
+            f"{len(patch['segments'])} color zone(s)" + (f", unit {unit}" if unit else "") + ".")
+
+
+@mcp.tool()
+def list_theme_vibes() -> str:
+    """List the built-in theme vibes you can generate with generate_theme."""
+    return ("Vibes: " + ", ".join(sorted(theming.VIBES.keys()))
+            + ". Or pass an accent hex color for a custom brand theme.")
+
+
+@mcp.tool()
+def generate_theme(description: str = "", accent: str = "",
+                   apply_to_buffer: bool = True) -> str:
+    """Generate a layout theme from a vibe description or a brand color, and (by
+    default) apply it to the working buffer.
+
+    Args:
+        description: Free text, e.g. 'fighter jet HUD', 'synthwave neon', 'clean apple'.
+        accent: A brand hex color to build the theme around (overrides description).
+        apply_to_buffer: Set the buffer layout's theme + accentColor (default true).
+    """
+    if accent:
+        try:
+            theme = theming.brand_theme(accent)
+        except ValueError as e:
+            return f"Bad accent color: {e}"
+    elif description:
+        theme = theming.theme_for(description)
+    else:
+        return "Provide a description (e.g. 'synthwave') or an accent hex color."
+    pretty = json.dumps(theme, indent=2)
+    if apply_to_buffer:
+        if work_buffer is None:
+            return f"No active buffer to apply to. Theme:\n```json\n{pretty}\n```"
+        work_buffer.layout["theme"] = theme
+        if theme.get("accentColor"):
+            work_buffer.layout["accentColor"] = theme["accentColor"]
+        return (f"Applied theme (accent {theme.get('accentColor')}). push_buffer to see it.\n"
+                f"```json\n{pretty}\n```")
+    return pretty
+
+
+# ─── Live service tools (probe / simulate / auto-wire) ───────────────────────
+
+
+@mcp.tool()
+async def probe_service(seconds: int = 8, event: str = "broadcast") -> str:
+    """Listen to the live mesh and report the service's data schema: which events and
+    fields it emits, their value types, ranges, and examples. Run this, then
+    autowire_buffer / lint_against_traffic / infer_layout can use what was discovered.
+
+    Args:
+        seconds: How long to listen (default 8).
+        event: The mesh event to sniff (default 'broadcast', the data channel).
+    """
+    global last_probe_events
+    if not socket or not socket.is_running:
+        return "Not connected. Call connect first."
+    frames: list = []
+    prior = socket.handlers.get(event)
+
+    async def _rec(payload):
+        frames.append((event, payload))
+
+    socket.on(event, _rec)
+    try:
+        await asyncio.sleep(max(1, seconds))
+    finally:
+        if prior is not None:
+            socket.handlers[event] = prior
+        else:
+            socket.handlers.pop(event, None)
+    last_probe_events = probe.aggregate(frames)
+    return (f"Observed {len(frames)} frame(s) on '{event}' over {seconds}s.\n\n"
+            + probe.format_discovery(last_probe_events))
+
+
+@mcp.tool()
+async def simulate(payload_json: str, event: str = "broadcast") -> str:
+    """Emit a data frame onto the channel as if from the service — drives any synced
+    controls so gauges move and sparklines fill (live demo / no-backend testing).
+
+    Args:
+        payload_json: The frame to emit, e.g. {"battery":82,"cpu_temp":61}.
+        event: Event to emit on (default 'broadcast').
+    """
+    if not socket or not socket.is_running:
+        return "Not connected. Call connect first."
+    try:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    try:
+        await socket.send("broadcast_request" if event == "broadcast" else event, payload)
+    except Exception as e:
+        return f"Failed to emit: {e}"
+    return f"Emitted on '{event}': {json.dumps(payload)[:200]}"
+
+
+@mcp.tool()
+async def set_control_value(control_id: str, value_json: str) -> str:
+    """Drive one buffer control live by emitting a frame at its bound valuePath.
+
+    Args:
+        control_id: id of a control in the working buffer (must have a listen sync).
+        value_json: The value to push, e.g. 82 or "online" or true.
+    """
+    if not socket or not socket.is_running:
+        return "Not connected. Call connect first."
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    found = work_buffer.find(control_id)
+    if not found:
+        return f"No control '{control_id}' in the buffer."
+    binding = simulate_lib.control_binding(found[2])
+    if not binding:
+        return f"'{control_id}' has no listen sync to drive. Wire it first (autowire_buffer)."
+    event, path = binding
+    try:
+        value = json.loads(value_json)
+    except json.JSONDecodeError:
+        value = value_json  # treat as a bare string
+    frame = simulate_lib.build_frame({path: value})
+    try:
+        await socket.send("broadcast_request" if event == "broadcast" else event, frame)
+    except Exception as e:
+        return f"Failed: {e}"
+    return f"Drove {control_id} → {path}={value!r} on '{event}'."
+
+
+@mcp.tool()
+def autowire_buffer(event: str = "broadcast") -> str:
+    """Bind unbound display controls in the buffer to fields discovered by the last
+    probe_service run (matched by name). Run probe_service first."""
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    paths = probe.candidate_paths(last_probe_events)
+    if not paths:
+        return "No discovered fields yet. Run probe_service first."
+    wired = autowire.autowire_layout(work_buffer.layout, paths, event=event)
+    if not wired:
+        return "Nothing to wire (no unbound display controls matched a discovered field)."
+    return "Wired:\n" + "\n".join(f"  - {cid} → {p}" for cid, p in wired)
+
+
+@mcp.tool()
+def lint_against_traffic() -> str:
+    """Check the buffer's sync valuePaths against fields seen by the last probe; flags
+    bindings that would silently show no data (wrong path / namespace)."""
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    paths = probe.candidate_paths(last_probe_events)
+    if not paths:
+        return "No probe data yet. Run probe_service first."
+    findings = autowire.live_data_lint(work_buffer.layout, paths)
+    if not findings:
+        return "✓ Every synced valuePath was seen in observed traffic."
+    return "⚠ Paths not seen in traffic:\n" + "\n".join(
+        f"  - {f['id']}: {f['detail']}" for f in findings)
+
+
+# ─── Backend codegen (service stub / adapter) ────────────────────────────────
+
+
+def _layout_or_buffer(layout_json: str):
+    """Resolve a layout from JSON arg, else the working buffer. Returns (layout, error)."""
+    if layout_json:
+        try:
+            return json.loads(layout_json), None
+        except json.JSONDecodeError as e:
+            return None, f"Invalid JSON: {e}"
+    if work_buffer is not None:
+        return work_buffer.layout, None
+    return None, "No layout given and no active buffer. Pass layout_json or begin_edit."
+
+
+@mcp.tool()
+def generate_service(layout_json: str = "") -> str:
+    """Generate a runnable Python MeshSocket service that speaks to a layout — handles
+    the events its controls fire and emits the telemetry they listen for. Uses the
+    working buffer if no layout_json is given.
+
+    Args:
+        layout_json: Optional layout JSON; defaults to the working buffer.
+    """
+    layout, err = _layout_or_buffer(layout_json)
+    if err:
+        return err
+    return "```python\n" + codegen.generate_service_stub(layout) + "\n```"
+
+
+@mcp.tool()
+def generate_adapter(base_url: str = "https://api.example.com",
+                     layout_json: str = "") -> str:
+    """Generate a REST-poll → MeshSocket adapter that maps an API's fields to a
+    layout's synced valuePaths. Uses the working buffer if no layout_json is given.
+
+    Args:
+        base_url: The REST endpoint to poll.
+        layout_json: Optional layout JSON; defaults to the working buffer.
+    """
+    layout, err = _layout_or_buffer(layout_json)
+    if err:
+        return err
+    return "```python\n" + codegen.generate_rest_adapter(layout, base_url=base_url) + "\n```"
+
+
+@mcp.tool()
+async def show_mesh_graph(name: str = "Mesh") -> str:
+    """Visualize the live MeshSocket network on the device — builds a graph layout and
+    pushes the current roster as animated nodes/edges. "Show me my mesh."
+
+    Replaces the working buffer with the mesh layout.
+
+    Args:
+        name: Layout name.
+    """
+    global work_buffer
+    if not socket or not socket.is_running:
+        return "Not connected. Call connect first."
+    try:
+        result = await socket.request("get_nodes", timeout=3.0)
+    except Exception as e:
+        return f"Couldn't read the roster: {e}"
+    clients = result.get("clients", []) if isinstance(result, dict) else []
+    graphdata = meshgraph.roster_to_graph(clients)
+    work_buffer = LayoutBuffer.from_layout(meshgraph.build_mesh_layout(name))
+    push_result = await _apply_or_broadcast(work_buffer.layout)
+    frame = simulate_lib.build_frame({meshgraph.MESH_VALUE_PATH: json.dumps(graphdata)})
+    try:
+        await socket.send("broadcast_request", frame)
+    except Exception:
+        pass
+    return f"Pushed a mesh graph with {len(graphdata['nodes'])} node(s). {push_result}"
+
+
+# ─── QA / testing over the mesh ──────────────────────────────────────────────
+
+
+async def _fetch_control_state(ids: Optional[list[str]] = None) -> Optional[dict]:
+    """Raw control values from the device (routed get-control-state)."""
+    device_id = await _get_device_id()
+    if not device_id:
+        return None
+    payload = {"ids": ids} if ids else None
+    result = await socket.request("route_msg", {
+        "target_id": device_id, "type": "get-control-state", "payload": payload,
+    }, timeout=5.0)
+    if isinstance(result, dict):
+        return result.get("values", {})
+    return None
+
+
+@mcp.tool()
+async def run_scenario(steps_json: str) -> str:
+    """Drive the device through a scripted scenario and assert control states — UI
+    testing over the mesh, no XCUITest.
+
+    Each step: {"emit": {...frame...}, "event": "broadcast", "wait": 0.5,
+                "expect": {"control_id": expected_value, ...}}.
+    `emit` pushes a data frame; after `wait` seconds the named controls are read back
+    and compared to `expect`.
+
+    Args:
+        steps_json: JSON array of step objects.
+    """
+    if not socket or not socket.is_running:
+        return "Not connected. Call connect first."
+    try:
+        steps = json.loads(steps_json)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON: {e}"
+    if not isinstance(steps, list):
+        return "steps_json must be an array of step objects."
+
+    lines, passed, failed = [], 0, 0
+    for i, step in enumerate(steps):
+        emit = step.get("emit")
+        event = step.get("event", "broadcast")
+        if emit is not None:
+            await socket.send("broadcast_request" if event == "broadcast" else event, emit)
+        await asyncio.sleep(step.get("wait", 0.5))
+        expect = step.get("expect")
+        if not expect:
+            lines.append(f"step {i}: emitted")
+            continue
+        actual = await _fetch_control_state(list(expect.keys())) or {}
+        fails = qa.assert_values(expect, actual)
+        if fails:
+            failed += 1
+            lines.append(f"step {i}: FAIL — " + "; ".join(f"{f['id']}: {f['detail']}" for f in fails))
+        else:
+            passed += 1
+            lines.append(f"step {i}: ok ({', '.join(expect.keys())})")
+    return f"Scenario: {passed} passed, {failed} failed.\n" + "\n".join(lines)
+
+
+# ─── Chat agent surface ──────────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def say_in_chat(text: str, sender_name: str = "Claude") -> str:
+    """Post a message into a layout's channel chat control as the LLM — the in-app
+    agent surface. Requires a paired device showing a chat control.
+
+    Args:
+        text: The message to send.
+        sender_name: Display name to send as (default 'Claude').
+    """
+    if not socket or not socket.is_running:
+        return "Not connected. Call connect first."
+    msg = chat.build_chat_message(text, sender_name=sender_name, channel=current_channel or "")
+    try:
+        await socket.send("chat_message", msg)
+    except Exception as e:
+        return f"Failed to send: {e}"
+    return f"Sent to chat as {sender_name}: {text!r}"
+
+
+@mcp.tool()
+async def read_chat(seconds: int = 15) -> str:
+    """Listen for incoming chat messages for a while and return them — so the LLM can
+    answer what users type in an in-app chat control.
+
+    Args:
+        seconds: How long to listen (default 15).
+    """
+    if not socket or not socket.is_running:
+        return "Not connected. Call connect first."
+    msgs: list = []
+    prior = socket.handlers.get("chat_message")
+
+    async def _rec(payload):
+        m = chat.parse_incoming(payload)
+        if m:
+            msgs.append(m)
+
+    socket.on("chat_message", _rec)
+    try:
+        await asyncio.sleep(max(1, seconds))
+    finally:
+        if prior is not None:
+            socket.handlers["chat_message"] = prior
+        else:
+            socket.handlers.pop("chat_message", None)
+    if not msgs:
+        return f"No chat messages in {seconds}s."
+    return "\n".join(f"{m['sender']}: {m['text']}" for m in msgs)
+
+
+# ─── Snapshot / revert (experiment fearlessly) ───────────────────────────────
+
+
+@mcp.tool()
+def snapshot_buffer(label: str = "") -> str:
+    """Save a snapshot of the working buffer so you can revert later."""
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    name = label or f"snapshot {len(buffer_snapshots) + 1}"
+    buffer_snapshots.append((name, copy.deepcopy(work_buffer.layout)))
+    return f"Saved '{name}' ({len(buffer_snapshots)} snapshot(s) total)."
+
+
+@mcp.tool()
+def list_snapshots() -> str:
+    """List saved buffer snapshots."""
+    if not buffer_snapshots:
+        return "No snapshots yet. Use snapshot_buffer."
+    return "\n".join(f"  {i}: {label}" for i, (label, _) in enumerate(buffer_snapshots))
+
+
+@mcp.tool()
+def revert_buffer(index: int = -1) -> str:
+    """Restore the working buffer from a snapshot (default the most recent).
+
+    Args:
+        index: Snapshot index (see list_snapshots); -1 = latest.
+    """
+    global work_buffer
+    if not buffer_snapshots:
+        return "No snapshots to revert to."
+    try:
+        label, layout = buffer_snapshots[index]
+    except IndexError:
+        return f"No snapshot at index {index}."
+    work_buffer = LayoutBuffer.from_layout(layout)
+    return f"Reverted buffer to '{label}'.\n\n" + work_buffer.summary()
+
+
+async def _poll_peers() -> list[dict]:
+    """Fetch the live roster via the `get_nodes` request and refresh the cache.
+    Polling is the source of truth: the relay's identify-time roster push races
+    client registration, so later joiners never arrive via the push."""
+    global peer_list
+    if not (socket and socket.is_running):
+        return []
+    try:
+        result = await socket.request("get_nodes", timeout=3.0)
+    except Exception:
+        return peer_list
+    if isinstance(result, dict):
+        peer_list = [c for c in result.get("clients", []) if c.get("name") != "carter-mcp-editor"]
+    return peer_list
 
 
 async def _get_device_id() -> Optional[str]:
