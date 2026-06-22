@@ -68,23 +68,19 @@ from mcp.server.fastmcp import FastMCP
 import qrcode
 
 import autowire
-import catalog
 import chat
-import codegen
-import grid
 import meshgraph
 import qa
-import infer
 import probe
 import simulate as simulate_lib  # aliased: the `simulate` @mcp.tool() below shadows this module name
-import theming
-import tune
-import validate
-from buffer import LayoutBuffer, BufferError
 
-# MeshSocket library
-sys.path.insert(0, "/Users/carter/Desktop/Programming/MeshSocket/Python")
-from socketCore import MeshSocket
+# Layout-authoring engine now lives in the carterkit package (pip install carterkit) —
+# catalog/builder/validate/codegen/infer/theming/tune are no longer vendored here.
+from carterkit import catalog, codegen, grid, infer, theming, tune, validate
+from carterkit.buffer import LayoutBuffer, BufferError
+
+# MeshSocket client (PyPI: `pip install meshsocket`)
+from meshsocket import MeshSocket
 
 # Paths
 PROJECT_ROOT = Path(__file__).parent.parent
