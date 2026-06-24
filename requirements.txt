@@ -1,6 +1,6 @@
 # carter-mcp runtime dependencies.
 # The layout-authoring engine (catalog, buffer, grid, validate, codegen, infer,
 # theming, tune) now comes from carterkit; meshsocket arrives transitively via it.
-carterkit>=0.1
+carterkit>=0.5.0
 mcp>=1.0
 qrcode[pil]>=7.4

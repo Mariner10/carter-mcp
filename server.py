@@ -76,7 +76,7 @@ import simulate as simulate_lib  # aliased: the `simulate` @mcp.tool() below sha
 
 # Layout-authoring engine now lives in the carterkit package (pip install carterkit) —
 # catalog/builder/validate/codegen/infer/theming/tune are no longer vendored here.
-from carterkit import catalog, codegen, grid, infer, theming, tune, validate
+from carterkit import catalog, codegen, grid, infer, theming, tune, validate, dynamic
 from carterkit.buffer import LayoutBuffer, BufferError
 
 # MeshSocket client (PyPI: `pip install meshsocket`)
@@ -119,6 +119,9 @@ control_edit_future: Optional[asyncio.Future] = None
 # Aggregated traffic schema from the last probe_service run (event -> path -> stats),
 # consumed by autowire_buffer / lint_against_traffic.
 last_probe_events: dict = {}
+# Raw decoded payloads from the last probe_service run, consumed by
+# lint_dynamic_traffic (which needs the actual `children` arrays, not the aggregate).
+last_probe_frames: list = []
 # Saved buffer states for snapshot / revert (experiment fearlessly).
 buffer_snapshots: list[tuple[str, dict]] = []
 # Active session connection target, set by connect(); lets the relay URL/token be
@@ -155,8 +158,12 @@ Workflow:
 
 Key layout concepts:
 - A layout has tabs, each with a grid of children (controls or groups)
-- Controls have type, id, position [row, col], and optional span [rows, cols]
-- Groups are containers with their own sub-grid
+- The grid is true 2-D by default (mode "grid"): a child fills a row x col rectangle
+  (position [row,col] + span [rowSpan,colSpan]); colSpan=width, rowSpan x rowHeight=height.
+  Span more cells to make a control bigger. Use grid mode "flow" for a full-page
+  map/chat/cardList or a plain form.
+- Controls have type, id, position [row, col], and optional span [rowSpan, colSpan]
+- Groups are containers with their own sub-grid (and their own mode)
 - Connection config enables real-time sync with a server
 - Controls can have actions (send commands) and sync (receive data)
 """,
@@ -302,10 +309,16 @@ def get_layout_schema() -> str:
 {
   "title": "string (required)",
   "icon": "string — SF Symbol name (required)",
-  "grid": { "columns": int, "rows": int },
+  "grid": { "columns": int, "rows": int, "mode": "grid|flow", "rowHeight": int },
   "children": [ ChildDefinition, ... ]
 }
 ```
+
+**Grid modes:** a grid is `columns × rows`. The default `mode: "grid"` is true 2-D —
+each child fills a `row × col` rectangle (`colSpan`=width, `rowSpan × rowHeight`=height,
+default `rowHeight` 56pt), so a tall control can sit beside two stacked shorter ones.
+Use `mode: "flow"` for the legacy row-banded layout (a full-page `map`/`chat`/`cardList`,
+or a plain form). A square control (ring, full gauge) reads best at ~3 `rowSpan`; inputs at 1.
 
 ## ChildDefinition
 
@@ -317,13 +330,15 @@ Either a control or a group:
   "type": "button|toggle|slider|stepper|segmentedControl|picker|datePicker|textInput|colorPicker|label|image|gauge|sparkline|progressRing|map|graph|chat|cardList",
   "id": "string (required, unique)",
   "position": [row, col],
-  "span": [rowSpan, colSpan] (default [1, 1]),
+  "span": [rowSpan, colSpan] (default [1, 1]) — 2-D grid: colSpan=width, rowSpan=height,
+  "controlHeight": number — override grid-derived height (rarely needed),
   "label": "string",
   "defaultValue": any,
   "icon": "string — SF Symbol",
   "tint": "#hex",
   "hideLabel": bool,
-  "hideBackground": bool,
+  "hideValue": bool — ring/gauge: hide the center number (a compact, scaling visual),
+  "hideBackground": bool — drop the card; the control floats and fills its cell,
 
   // Type-specific fields:
   "min": number, "max": number, "step": number,
@@ -382,7 +397,7 @@ Either a control or a group:
   "label": "string",
   "position": [row, col],
   "span": [rowSpan, colSpan],
-  "grid": { "columns": int, "rows": int },
+  "grid": { "columns": int, "rows": int, "mode": "grid|flow", "rowHeight": int },
   "children": [ ChildDefinition, ... ],
   "dynamic": "string — event name for dynamic content",
   "visible": { ... }
@@ -994,7 +1009,38 @@ def _catalog(include_theme: bool = False) -> dict:
     return _catalog_cache[include_theme]
 
 
+# 2-D grid default spans [rowSpan, colSpan], tuned so each control reads at its
+# natural aspect in the default ~4-column grid (rowHeight ~56pt): square visuals get
+# ~3 rows, wide visuals span columns, inputs sit in 1 row, content panels are tall.
+# infer auto-grows rows, so tall spans are safe; colSpan stays <= 4 to fit the
+# default grid width (a narrower grid will report "grow the grid").
+_SPAN_2D: dict[str, list[int]] = {
+    # square visuals
+    "progressRing": [3, 2], "gauge": [2, 3], "joystick": [3, 3], "qrCode": [3, 3],
+    # wide visual
+    "sparkline": [2, 4],
+    # tall content panels (infer grows rows to fit)
+    "map": [4, 4], "graph": [4, 4], "chat": [5, 4], "list": [4, 4],
+    "cardList": [4, 4], "logConsole": [3, 4], "webView": [4, 4], "image": [3, 3],
+    # container controls (hold groups)
+    "carousel": [4, 4], "flipCard": [4, 4], "accordion": [4, 4],
+    # row inputs + text (1 row tall)
+    "slider": [1, 2], "stepper": [1, 2], "segmentedControl": [1, 2],
+    "picker": [1, 2], "datePicker": [1, 2], "colorPicker": [1, 2],
+    "textInput": [1, 2], "toggle": [1, 2], "button": [1, 2],
+    "label": [1, 2], "statusLight": [1, 2],
+    # structural
+    "divider": [1, 4], "spacer": [1, 1],
+}
+
+
 def _default_span_for(control_type: str) -> Optional[list[int]]:
+    """2-D-tuned default span for a control type (see `_SPAN_2D`) — squares get a
+    near-square footprint, inputs a single row, content a tall panel. Falls back to
+    the control doc's catalog `defaultSpan` for anything not mapped."""
+    span = _SPAN_2D.get(control_type)
+    if span is not None:
+        return list(span)
     entry = _catalog().get(control_type)
     return entry.get("defaultSpan") if entry else None
 
@@ -1038,7 +1084,8 @@ async def _persist_layout_obj(layout: dict, filename: str = "") -> str:
 @mcp.tool()
 async def begin_edit(name: str = "Untitled", columns: int = 4, rows: int = 8,
                      accent: str = "#667eea", from_sample: str = "",
-                     from_device: bool = False) -> str:
+                     from_device: bool = False,
+                     mode: Optional[str] = None, row_height: Optional[int] = None) -> str:
     """Start (or restart) the working layout buffer for incremental editing.
 
     Then use add_control / insert_example / update_control / move_control / etc. to
@@ -1049,6 +1096,8 @@ async def begin_edit(name: str = "Untitled", columns: int = 4, rows: int = 8,
         name: Layout name (blank-buffer mode).
         columns, rows: Grid of the first tab (blank-buffer mode).
         accent: Accent color hex (blank-buffer mode).
+        mode, row_height: First tab's grid mode ("grid" default 2-D / "flow") and 2-D
+            row-unit height in points (blank-buffer mode).
         from_sample: Seed from a sample layout filename (e.g. 'demo-offline.json').
         from_device: Seed from the layout currently live on the paired device (read-modify-write).
     """
@@ -1076,7 +1125,11 @@ async def begin_edit(name: str = "Untitled", columns: int = 4, rows: int = 8,
             return f"Couldn't load sample: {e}"
         return f"Buffer seeded from {fname}.\n\n" + work_buffer.summary()
     work_buffer = LayoutBuffer.blank(name=name, columns=columns, rows=rows, accent=accent)
-    return f"New blank buffer '{name}' ({rows}x{columns}).\n\n" + work_buffer.summary()
+    if mode is not None:
+        work_buffer.tabs[0]["grid"]["mode"] = mode
+    if row_height is not None:
+        work_buffer.tabs[0]["grid"]["rowHeight"] = row_height
+    return f"New blank buffer '{name}' ({rows}x{columns}, mode={mode or 'grid'}).\n\n" + work_buffer.summary()
 
 
 @mcp.tool()
@@ -1213,12 +1266,24 @@ def move_control(control_id: str, position: Optional[list[int]] = None,
 
 @mcp.tool()
 def add_tab(title: str, icon: str = "square.grid.2x2",
-            columns: int = 4, rows: int = 8) -> str:
-    """Add a tab to the buffer. Returns its index."""
+            columns: int = 4, rows: int = 8,
+            mode: Optional[str] = None, row_height: Optional[int] = None) -> str:
+    """Add a tab to the buffer. Returns its index.
+
+    mode: "grid" (default 2-D — controls span row x col) or "flow" (legacy
+    row-banded; use for a full-page map/chat/cardList or a plain form).
+    row_height: points per row-unit in 2-D mode (default 56)."""
     if work_buffer is None:
         return "No active buffer. Call begin_edit first."
-    idx = work_buffer.add_tab(title, icon=icon, columns=columns, rows=rows)
-    return f"Added tab {idx}: '{title}' ({rows}x{columns})."
+    # Only forward mode/row_height when set, so the default path still works against
+    # a pre-0.5.0 carterkit (its add_tab doesn't accept those kwargs).
+    extra = {}
+    if mode is not None:
+        extra["mode"] = mode
+    if row_height is not None:
+        extra["row_height"] = row_height
+    idx = work_buffer.add_tab(title, icon=icon, columns=columns, rows=rows, **extra)
+    return f"Added tab {idx}: '{title}' ({rows}x{columns}, mode={mode or 'grid'})."
 
 
 @mcp.tool()
@@ -1509,7 +1574,7 @@ async def probe_service(seconds: int = 8, event: str = "broadcast") -> str:
         seconds: How long to listen (default 8).
         event: The mesh event to sniff (default 'broadcast', the data channel).
     """
-    global last_probe_events
+    global last_probe_events, last_probe_frames
     if not socket or not socket.is_running:
         return "Not connected. Call connect first."
     frames: list = []
@@ -1527,6 +1592,7 @@ async def probe_service(seconds: int = 8, event: str = "broadcast") -> str:
         else:
             socket.handlers.pop(event, None)
     last_probe_events = probe.aggregate(frames)
+    last_probe_frames = [payload for _ev, payload in frames]
     return (f"Observed {len(frames)} frame(s) on '{event}' over {seconds}s.\n\n"
             + probe.format_discovery(last_probe_events))
 
@@ -1613,6 +1679,25 @@ def lint_against_traffic() -> str:
         return "✓ Every synced valuePath was seen in observed traffic."
     return "⚠ Paths not seen in traffic:\n" + "\n".join(
         f"  - {f['id']}: {f['detail']}" for f in findings)
+
+
+@mcp.tool()
+def lint_dynamic_traffic() -> str:
+    """Check the buffer's `dynamic=` groups against the broadcasts seen by the last
+    probe: events that never arrive, payloads missing a `children` array, and injected
+    children that won't render (unknown type, bad enum, id clash, off-grid placement).
+    Run probe_service first. The dynamic-content counterpart to lint_against_traffic."""
+    if work_buffer is None:
+        return "No active buffer. Call begin_edit first."
+    groups = dynamic.dynamic_groups(work_buffer.layout)
+    if not groups:
+        return "No dynamic groups in the buffer (no group has a `dynamic` event)."
+    if not last_probe_frames:
+        return "No probe data yet. Run probe_service first."
+    findings = dynamic.lint_dynamic_traffic(work_buffer.layout, last_probe_frames)
+    if not findings:
+        return f"✓ All {len(groups)} dynamic group(s) get well-formed children from observed traffic."
+    return validate.format_findings(findings)
 
 
 # ─── Backend codegen (service stub / adapter) ────────────────────────────────
