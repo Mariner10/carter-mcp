@@ -101,12 +101,11 @@ from meshsocket import MeshSocket
 
 # Paths
 PROJECT_ROOT = Path(__file__).parent.parent
-# Control definitions and example/demo snippets are no longer read from a fixed
-# local checkout — they're resolved live by `sources` (website catalog + latest
-# carterkit), which falls back to this repo path only as a last resort in dev.
-CONTROL_DOCS_DIR = PROJECT_ROOT / "CAR-TER" / "CAR-TER" / "ControlDocs"
+# Control definitions and example/demo snippets are resolved live by `sources`
+# (website catalog + latest carterkit) — see sources.py. The only local-workspace
+# path left is the bundled sample layouts, read when this repo sits beside the app
+# repo in the CAR-TER workspace; it's simply empty in a standalone checkout.
 SAMPLE_LAYOUTS_DIR = PROJECT_ROOT / "CAR-TER" / "CAR-TER" / "SampleLayouts"
-DOCS_DIR = PROJECT_ROOT / "CAR-TER" / "docs"
 
 
 def _definitions_dir() -> Path:
@@ -118,7 +117,7 @@ def _demos_dir() -> Path:
     """Docs dir for example snippets / authoring demos (latest installed carterkit)."""
     return sources.demos_docs_dir()
 
-RELAY_URL = os.environ.get("CARTER_RELAY_URL", "wss://carterbeaudoin.com/coms/")
+RELAY_URL = os.environ.get("CARTER_RELAY_URL", "")
 RELAY_TOKEN = os.environ.get("CARTER_MESH_TOKEN", "")
 
 # ─── QR helpers ──────────────────────────────────────────────────────────────
@@ -844,6 +843,9 @@ async def connect(channel: str = "editor", role: str = "editor",
                           f"(phone must share this Wi-Fi)")
     else:
         active_url = url or RELAY_URL
+        if not active_url:
+            return ("Gateway target needs a relay URL: pass url=… or set "
+                    "CARTER_RELAY_URL.")
         active_qr_url = active_url
         active_token = token or RELAY_TOKEN
         if not active_token:

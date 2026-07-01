@@ -1,11 +1,9 @@
 # CAR-TER Authoring Protocol — Read-back + Truthful Push
 
 The wire contract between the **carter-mcp editor** (this repo, Python) and the
-**CAR-TER device** (the Swift app, separate repo). The MCP side is implemented here on
-branch `feat/mcp-readback`; the **device side is a separate Track-1 task** that must implement
-the responders described below.
-
-Source spec: `../docs/superpowers/specs/2026-06-20-mcp-readback-preview-design.md`.
+**CAR-TER device** (the Swift app). It defines the read-back and truthful-push
+responders the device implements so the editor can preview, verify, and safely
+push layouts.
 
 ## Transports
 
