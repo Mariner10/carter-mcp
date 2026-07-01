@@ -94,6 +94,34 @@ Reply:
 }
 ```
 
+### `get-device-info`  (version / drift detection)
+Report which CAR-TER app build the device is running so the editor can detect when
+the phone's installed app has drifted from the **published control definitions**
+(the website catalog) or the **authoring kit** (carterkit). The MCP `check_sources`
+tool reconciles all three; this verb provides the device leg.
+
+Request payload: `null`
+
+Reply:
+```json
+{
+  "ok": true,
+  "appVersion": "1.3.0",            // CFBundleShortVersionString
+  "build": "57",                    // CFBundleVersion
+  "protocolVersion": 1,             // layout/wire protocol the app speaks
+  "catalogFingerprint": "sha256:…", // OPTIONAL — hash of the ControlDocs the app bundles
+  "model": "iPhone15,2",            // OPTIONAL
+  "osVersion": "18.5"               // OPTIONAL
+}
+```
+All fields except `ok` are optional and the MCP tolerates their absence — an older
+app that doesn't implement this verb simply times out, which the MCP reports as
+"update the app to enable drift detection." If the app already carries the
+`catalogFingerprint` of its bundled ControlDocs, the MCP compares it to the
+website catalog's `manifest.fingerprint` to tell whether the installed app matches
+the published definitions exactly. For convenience, newer apps MAY also fold these
+same fields into the `get-connection-status` reply; the MCP reads either source.
+
 ### `apply-layout`  (truthful push)
 Apply a layout and report exactly what rendered. Replaces blind broadcast push when a single
 device is resolvable.
@@ -125,8 +153,31 @@ is resolvable.
 - **single device resolved** → routed `apply-layout` (truthful, returns the rendered echo);
 - **no device resolved** → broadcast `layout-update` (no render confirmation).
 
+## Control-edit handoff ("shape it on glass")
+
+Lets the USER customize a control by hand on the phone, then the MCP reads it back.
+The device side already exists (`AppState+Broadcast.swift`, `ControlConfiguratorView`,
+`AppState+Actions.swift sendControlEditResponse`); the MCP side is the `customize_on_phone`
+tool + a `control-edit-response` listener (server.py). Both legs are broadcast frames on
+the channel; only consumed while the device is in a live-edit session.
+
+`control-edit-request` (MCP → phone, `broadcast_request`):
+```json
+{ "msg_type": "control-edit-request",
+  "control": { "type": "gauge", "id": "battery", "...seed props...": "..." } }
+```
+The phone opens the configurator (live preview + doc-driven field form) seeded from the
+control's props. The user edits and taps **"Send to Editor"**.
+
+`control-edit-response` (phone → MCP, emit on event `control-edit-response`):
+```json
+{ "msg_type": "control-edit-response",
+  "control": { "...all edited props...": "...", "type": "gauge", "id": "battery" } }
+```
+The MCP receives it via `@socket.on("control-edit-response")` (the device emits it with
+plain `send`, which the relay fans out to channel peers — the same pattern chat uses).
+
 ## Out of scope (this contract)
 
 - Visual preview (screenshot / PNG / perceptual hash) — structural echo only.
 - A device→editor `layout-ack` broadcast (the routed reply carries the ack).
-- `control-edit-request` / `control-edit-response` round-trip for the MCP.

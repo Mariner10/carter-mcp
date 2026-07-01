@@ -7,3 +7,7 @@ venv/
 .env
 *.local
 .DS_Store
+
+# local debugging scratch (not part of the MCP)
+diag_*.py
+DEBUG-*.md

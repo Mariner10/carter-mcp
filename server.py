@@ -2,10 +2,26 @@
 """
 CAR-TER MCP Server
 
-Gives an LLM access to CAR-TER control documentation and the ability
-to push live layout updates to a paired device over MeshSocket.
+A thin, LOCAL tool layer that gives an LLM access to CAR-TER's live control
+documentation and the ability to push layout updates to a paired iPhone/iPad over
+MeshSocket. It does not vendor the control vocabulary — it pulls it from the
+current sources at call time:
+
+  • Control DEFINITIONS (the catalog + doc prose) come from the WEBSITE
+    (carterbeaudoin.net/CAR-TER/catalog.json), cached locally with offline fallback.
+  • Authoring DEMOS ("how to write code": example snippets + the codegen/builder
+    engine) come from the installed carterkit, with a PyPI check for newer releases.
+  • check_sources reconciles those against the paired device's app version so the
+    model can detect and report drift.
+
+See `sources.py` for the resolution/cache logic and `PROTOCOL.md` for the wire
+contract (including the get-device-info readback).
 
 Tools:
+  Sources & versioning:
+    - check_sources        Where definitions/demos come from + drift verdict
+    - get_device_info      Paired app's version / protocol (drift detection)
+
   Documentation:
     - list_controls        List all control types
     - get_control_doc      Get full doc for a control/system feature
@@ -73,6 +89,7 @@ import meshgraph
 import qa
 import probe
 import simulate as simulate_lib  # aliased: the `simulate` @mcp.tool() below shadows this module name
+import sources  # live control DEFINITIONS (website) + authoring DEMOS (latest carterkit)
 
 # Layout-authoring engine now lives in the carterkit package (pip install carterkit) —
 # catalog/builder/validate/codegen/infer/theming/tune are no longer vendored here.
@@ -84,9 +101,22 @@ from meshsocket import MeshSocket
 
 # Paths
 PROJECT_ROOT = Path(__file__).parent.parent
+# Control definitions and example/demo snippets are no longer read from a fixed
+# local checkout — they're resolved live by `sources` (website catalog + latest
+# carterkit), which falls back to this repo path only as a last resort in dev.
 CONTROL_DOCS_DIR = PROJECT_ROOT / "CAR-TER" / "CAR-TER" / "ControlDocs"
 SAMPLE_LAYOUTS_DIR = PROJECT_ROOT / "CAR-TER" / "CAR-TER" / "SampleLayouts"
 DOCS_DIR = PROJECT_ROOT / "CAR-TER" / "docs"
+
+
+def _definitions_dir() -> Path:
+    """Docs dir for the control catalog + doc prose (website-sourced, cached)."""
+    return sources.definitions_docs_dir()
+
+
+def _demos_dir() -> Path:
+    """Docs dir for example snippets / authoring demos (latest installed carterkit)."""
+    return sources.demos_docs_dir()
 
 RELAY_URL = os.environ.get("CARTER_RELAY_URL", "wss://carterbeaudoin.com/coms/")
 RELAY_TOKEN = os.environ.get("CARTER_MESH_TOKEN", "")
@@ -144,17 +174,32 @@ VALIDATOR_URL = os.environ.get("CARTER_VALIDATOR_URL", "")
 
 mcp = FastMCP(
     "carter",
-    instructions="""You are a CAR-TER layout editor. You can read the full control documentation
-to understand every available control type, then build and push layouts to a
-paired iPhone/iPad in real time over MeshSocket.
+    instructions="""You are a CAR-TER layout editor. You read CAR-TER's live control
+documentation to understand every available control type, then build and push
+layouts to a paired iPhone/iPad in real time over MeshSocket.
+
+Where your knowledge comes from (don't guess from memory — pull it):
+- Control DEFINITIONS (catalog, fields, doc prose) are fetched from the CAR-TER
+  website and cached locally. list_controls / get_control_doc / get_control_catalog
+  reflect what is *currently published*, not a bundled snapshot.
+- Authoring DEMOS (example snippets, generators) come from the installed carterkit.
+- These can drift from each other and from the phone's installed app.
 
 Workflow:
-1. Use list_controls and get_control_doc to learn the available controls
-2. Use get_layout_schema for the overall layout structure
-3. Use get_sample_layout to see real examples
-4. Use connect to pair with a device (user scans QR code)
-5. Build a layout JSON and push_layout to see it live on device
-6. Iterate — each push_layout updates the device instantly
+1. Run check_sources first. It confirms the website catalog is reachable/fresh,
+   the carterkit is current (offer `pip install -U carterkit` if not), and — once a
+   device is paired — that the app's version/protocol match the definitions. If it
+   reports drift, surface it to the user before authoring.
+2. Use list_controls and get_control_doc to learn the available controls; use
+   get_control_catalog for the machine-readable schema in one call.
+3. Use get_layout_schema for the overall layout structure; get_sample_layout and
+   get_control_example for real, ready-to-tweak snippets.
+4. Use connect to pair with a device — the user scans the QR code in CAR-TER
+   (Settings → Live Edit / scan). Then get_device_info to confirm the app version.
+5. Build a layout JSON and push_layout to see it live on the device.
+6. Iterate — each push_layout updates the device instantly. If a control or field
+   is ignored on the phone, re-run check_sources: the app is likely older than the
+   published definitions.
 
 Key layout concepts:
 - A layout has tabs, each with a grid of children (controls or groups)
@@ -173,7 +218,7 @@ Key layout concepts:
 # ─── Documentation Tools ─────────────────────────────────────────────────────
 
 def _load_doc(doc_id: str) -> Optional[str]:
-    path = CONTROL_DOCS_DIR / f"{doc_id}.md"
+    path = _definitions_dir() / f"{doc_id}.md"
     if path.exists():
         return path.read_text()
     return None
@@ -181,7 +226,7 @@ def _load_doc(doc_id: str) -> Optional[str]:
 
 def _list_doc_files() -> list[dict]:
     results = []
-    for f in sorted(CONTROL_DOCS_DIR.glob("*.md")):
+    for f in sorted(_definitions_dir().glob("*.md")):
         node_id = f.stem
         content = f.read_text()
         label = node_id
@@ -230,7 +275,7 @@ def get_control_doc(control_id: str) -> str:
     """
     content = _load_doc(control_id)
     if content is None:
-        available = [f.stem for f in CONTROL_DOCS_DIR.glob("*.md")]
+        available = [f.stem for f in _definitions_dir().glob("*.md")]
         return f"No doc found for '{control_id}'. Available: {', '.join(sorted(available))}"
     return content
 
@@ -454,7 +499,7 @@ def get_control_catalog(types: Optional[list[str]] = None,
         types: Optional list of control types/node-ids to filter to (e.g. ['gauge','button']).
         include_theme: Also include each control's per-control theme override fields.
     """
-    cat = catalog.build_catalog(CONTROL_DOCS_DIR, types=types, include_theme=include_theme)
+    cat = catalog.build_catalog(_definitions_dir(), types=types, include_theme=include_theme)
     if not cat:
         return (f"No controls matched {types}." if types else "No controls found.")
     return json.dumps(cat, indent=2)
@@ -469,7 +514,7 @@ def list_control_examples(control_id: str) -> str:
     Args:
         control_id: Control type or doc node-id (e.g. 'gauge', 'color-picker').
     """
-    examples = catalog.get_examples(CONTROL_DOCS_DIR, control_id)
+    examples = catalog.get_examples(_demos_dir(), control_id)
     if not examples:
         return f"No examples found for '{control_id}'. Try list_controls or get_control_doc."
     lines = [f"Examples for `{control_id}`:"]
@@ -488,13 +533,13 @@ def get_control_example(control_id: str, name: str = "") -> str:
         control_id: Control type or doc node-id (e.g. 'button', 'gauge').
         name: Example name (prefix match, case-insensitive). Omit for the first example.
     """
-    examples = catalog.get_examples(CONTROL_DOCS_DIR, control_id)
+    examples = catalog.get_examples(_demos_dir(), control_id)
     if not examples:
         return f"No examples found for '{control_id}'."
     if not name:
         ex = examples[0]
     else:
-        ex = catalog.find_example(CONTROL_DOCS_DIR, control_id, name)
+        ex = catalog.find_example(_demos_dir(), control_id, name)
         if not ex:
             avail = ", ".join(e["name"] for e in examples)
             return f"No example '{name}' for '{control_id}'. Available: {avail}"
@@ -598,6 +643,51 @@ def format_connection_status(resp: dict) -> str:
     if listening:
         lines.append(f"  listening: {', '.join(listening)}")
     return "\n".join(lines)
+
+
+# get-device-info  (app version / protocol / catalog fingerprint — for drift checks)
+#
+# The device echoes which CAR-TER app build the user is running so the model can
+# confirm the phone understands the control definitions it's authoring against.
+# An older app may simply drop controls or fields it doesn't know; comparing the
+# device's reported protocol/fingerprint to the website catalog catches that early.
+# The Swift responder is a separate device-side track (see PROTOCOL.md); the MCP
+# tolerates its absence (older apps just don't reply / omit the fields).
+
+_DEVICE_INFO_KEYS = ("appVersion", "build", "protocolVersion",
+                     "catalogFingerprint", "model", "osVersion")
+
+
+def extract_device_info(resp) -> Optional[dict]:
+    """Pull version fields out of a get-device-info / get-connection-status reply."""
+    if not isinstance(resp, dict):
+        return None
+    info = {k: resp[k] for k in _DEVICE_INFO_KEYS if k in resp}
+    return info or None
+
+
+def format_device_info(resp: dict) -> str:
+    info = extract_device_info(resp) or {}
+    if not info:
+        return ("Device did not report version info — it's an older app that "
+                "predates the device-info verb. Ask the user to update CAR-TER "
+                "to enable version drift detection.")
+    bits = []
+    if info.get("appVersion"):
+        v = f"app v{info['appVersion']}"
+        if info.get("build"):
+            v += f" (build {info['build']})"
+        bits.append(v)
+    if info.get("protocolVersion") is not None:
+        bits.append(f"protocol v{info['protocolVersion']}")
+    if info.get("model"):
+        bits.append(str(info["model"]))
+    if info.get("osVersion"):
+        bits.append(f"iOS {info['osVersion']}")
+    out = "Paired device: " + " · ".join(bits)
+    if info.get("catalogFingerprint"):
+        out += f"\n  catalog fingerprint: {str(info['catalogFingerprint'])[:23]}…"
+    return out
 
 
 # apply-layout (truthful push)
@@ -1005,7 +1095,7 @@ _catalog_cache: dict[bool, dict] = {}
 def _catalog(include_theme: bool = False) -> dict:
     if include_theme not in _catalog_cache:
         _catalog_cache[include_theme] = catalog.build_catalog(
-            CONTROL_DOCS_DIR, include_theme=include_theme)
+            _definitions_dir(), include_theme=include_theme)
     return _catalog_cache[include_theme]
 
 
@@ -1192,8 +1282,8 @@ def insert_example(control_id: str, name: str = "", tab_index: int = 0,
     """
     if work_buffer is None:
         return "No active buffer. Call begin_edit first."
-    ex = catalog.find_example(CONTROL_DOCS_DIR, control_id, name) if name \
-        else (catalog.get_examples(CONTROL_DOCS_DIR, control_id) or [None])[0]
+    ex = catalog.find_example(_demos_dir(), control_id, name) if name \
+        else (catalog.get_examples(_demos_dir(), control_id) or [None])[0]
     if not ex:
         return f"No matching example for '{control_id}'. Try list_control_examples."
     obj = catalog.example_as_obj(ex)
@@ -2015,6 +2105,67 @@ async def get_connection_status() -> str:
         None,
         on_ok=format_connection_status,
     )
+
+
+@mcp.tool()
+async def get_device_info() -> str:
+    """Read the paired device's CAR-TER app version, build, and protocol version.
+
+    Use this to confirm the phone's installed app understands the control
+    definitions you're authoring against. An older app silently drops controls or
+    fields it doesn't recognize — see check_sources for a full drift verdict.
+    """
+    return await _routed_request("get-device-info", None, on_ok=format_device_info)
+
+
+async def _device_info_if_connected() -> Optional[dict]:
+    """Best-effort device version readback for check_sources. Returns None (never
+    raises) when no device is paired or the app is too old to answer."""
+    if not socket or not socket.is_running:
+        return None
+    try:
+        device_id = await _get_device_id()
+    except Exception:
+        return None
+    if not device_id:
+        return None
+    # get-device-info is the dedicated verb; get-connection-status may also carry
+    # the version fields on newer apps, so try it as a fallback.
+    for verb in ("get-device-info", "get-connection-status"):
+        try:
+            result = await socket.request("route_msg", {
+                "target_id": device_id, "type": verb, "payload": None,
+            }, timeout=4.0)
+        except Exception:
+            result = None
+        info = extract_device_info(result)
+        if info:
+            return info
+    return None
+
+
+@mcp.tool()
+async def check_sources(refresh: bool = False) -> str:
+    """Report where the MCP is pulling truth from, and flag any drift.
+
+    CAR-TER's MCP is a thin local tool layer over live sources: control
+    DEFINITIONS come from the website catalog (carterbeaudoin.net/CAR-TER), and
+    authoring DEMOS come from the installed carterkit. This shows the catalog
+    version/freshness/fingerprint, installed-vs-latest carterkit, and — when a
+    device is paired — the phone's app/protocol version, then gives an alignment
+    verdict.
+
+    Run this at the start of a session, and again whenever a pushed layout behaves
+    unexpectedly, to catch the case where the site, the kit, and the app have
+    drifted out of sync.
+
+    Args:
+        refresh: Force a fresh fetch of the website catalog + PyPI version,
+                 bypassing the local cache.
+    """
+    device_info = await _device_info_if_connected()
+    status = sources.sources_status(device_info=device_info, refresh=refresh)
+    return sources.format_status(status)
 
 
 @mcp.tool()
