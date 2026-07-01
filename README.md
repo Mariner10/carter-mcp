@@ -107,3 +107,7 @@ python -m pytest -q
 - The sample-layout tools read layouts bundled beside the CAR-TER app repo in the
   original workspace; in a standalone checkout that set is simply empty — build
   layouts from the catalog and examples instead.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
