@@ -17,14 +17,14 @@ Two patterns, both already in production for the existing `list-layouts` / `save
   `handle(event: <verb>)` returning a `JSONValue?`. **All read-back verbs and the truthful push
   use this pattern.** The routed `type` string IS the MeshSocket event the device handles.
 
-## Device prerequisite (Track-1 / Swift)
+## Device prerequisite (Track-1 / Swift) — ✅ landed
 
-> The routed responders below are installed by `registerRequestHandlers()`, which today runs
-> **only** in the connected-layout load path — never during a QR live-edit session. The Swift
-> task MUST call `registerRequestHandlers()` during a live-edit session (and re-arm it on each
-> `applyLiveEditLayout`), tracking each verb in `activeListenerEvents` for clean teardown.
-> Until that lands, every verb below times out in the MCP flow. This is the gating fix and is
-> out of scope for the carter-mcp repo.
+> The routed responders below are installed by `registerRequestHandlers()`, which runs in
+> **both** the connected-layout load path **and** the QR live-edit session
+> (`startLiveEditSession` → `registerRequestHandlers()`), with each verb tracked in
+> `activeListenerEvents` for clean teardown. All verbs — including `get-device-info` — are
+> armed and answer during live edit (verified end-to-end; see `e2e-walkthrough/`). An app
+> build predating this still times out on these verbs, which the MCP surfaces as a drift hint.
 
 ## Routed verbs (MCP → device, with reply)
 
@@ -59,6 +59,24 @@ Reply:
 ```
 The `summary` is the **structural echo** — built from the live `LayoutConfig` AFTER it was applied,
 so it reflects what actually rendered (a control dropped on decode does not appear).
+
+### `get-layout`  (saved-layout readback)
+Read the full JSON of any layout **saved on the device**, active or not — the pull half of the
+phone-editor handoff (`save-layout` is the push half). Match by `file` (from `list-layouts`)
+or display `name`; passing both matches either.
+
+Request payload:
+```json
+{ "file": "my-layout.json" }   // or { "name": "My Layout" }
+```
+Reply:
+```json
+{ "ok": true, "file": "my-layout.json", "layout": { ...raw layout JSON... } }
+```
+`layout` is the **raw on-disk dict** (not a re-encoded `LayoutConfig`), so fields the app
+doesn't model survive a pull→wire→push round trip. Errors: `{ "ok": false, "error": "no such
+layout" | "pass file or name" | "layout file unreadable" }`. Additive verb — an older app
+simply never responds (the MCP reports the timeout).
 
 ### `get-control-state`
 Read current control values.
@@ -156,7 +174,7 @@ is resolvable.
 Lets the USER customize a control by hand on the phone, then the MCP reads it back.
 The device side already exists (`AppState+Broadcast.swift`, `ControlConfiguratorView`,
 `AppState+Actions.swift sendControlEditResponse`); the MCP side is the `customize_on_phone`
-tool + a `control-edit-response` listener (server.py). Both legs are broadcast frames on
+tool + a `control-edit-response` listener (`carter_mcp/tools/device.py` / `session.py`). Both legs are broadcast frames on
 the channel; only consumed while the device is in a live-edit session.
 
 `control-edit-request` (MCP → phone, `broadcast_request`):

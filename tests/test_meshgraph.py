@@ -1,6 +1,6 @@
 """Tests for meshgraph.py — roster → GraphData and the mesh layout."""
 
-import meshgraph
+from carter_mcp import meshgraph
 
 
 def test_roster_to_graph_hub_and_clients():

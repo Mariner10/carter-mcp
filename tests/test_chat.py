@@ -1,6 +1,6 @@
 """Tests for chat.py — outgoing message build + incoming parse."""
 
-import chat
+from carter_mcp import chat
 
 
 def test_build_chat_message_shape():

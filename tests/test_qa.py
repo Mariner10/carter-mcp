@@ -1,6 +1,6 @@
 """Tests for qa.py — value assertions and summary diffs."""
 
-import qa
+from carter_mcp import qa
 
 
 def test_assert_values_pass():

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carter-mcp"
+version = "0.6.0"
+description = "MCP server for authoring CAR-TER layouts conversationally and pushing them to a paired iPhone/iPad over MeshSocket."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+# The layout-authoring engine (catalog, buffer, grid, validate, codegen, infer,
+# theming, tune) comes from carterkit; meshsocket arrives transitively via it.
+dependencies = [
+    "carterkit>=0.5.0",
+    "mcp>=1.0",
+    "qrcode[pil]>=7.4",
+]
+
+[project.urls]
+Documentation = "https://carterbeaudoin.net/CAR-TER"
+
+[project.scripts]
+carter-mcp = "carter_mcp.app:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["carter_mcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -14,6 +14,11 @@ from typing import Optional
 DISPLAY_TYPES = {"gauge", "sparkline", "progressRing", "label", "statusLight",
                  "map", "graph", "cardList", "list"}
 
+# Controls whose whole point is firing an `action` — the "triggers" half of wiring.
+# (Drag-pack boards carry their sends in config `events`, so they're not listed.)
+INPUT_TYPES = {"button", "toggle", "slider", "stepper", "segmentedControl",
+               "picker", "datePicker", "textInput", "colorPicker", "joystick"}
+
 
 def _tokens(s: str) -> set[str]:
     return {t for t in re.split(r"[^a-z0-9]+", (s or "").lower()) if t}
@@ -44,12 +49,23 @@ def _control_name(control: dict) -> str:
 
 
 def _walk(children, fn):
+    """Visit every control, recursing through groups, container pages
+    (carousel/flipCard/accordion `panels`), and canvas-hosted controls — the same
+    nesting the phone's Layout Editor produces."""
     for ch in children or []:
         if not isinstance(ch, dict):
             continue
         fn(ch)
         if ch.get("type") == "group":
             _walk(ch.get("children"), fn)
+        for panel in ch.get("panels") or []:
+            if isinstance(panel, dict):
+                _walk(panel.get("children"), fn)
+        cfg = ch.get("canvasConfig")
+        if isinstance(cfg, dict):
+            for item in cfg.get("items") or []:
+                if isinstance(item, dict) and isinstance(item.get("control"), dict):
+                    fn(item["control"])
 
 
 def autowire_layout(layout: dict, paths: list[str], event: str = "broadcast") -> list[tuple]:
@@ -86,6 +102,25 @@ def collect_sync_paths(layout: dict) -> list[tuple]:
     for tab in layout.get("tabs", []):
         _walk(tab.get("children"), collect)
     return out
+
+
+def unwired_report(layout: dict) -> dict:
+    """What still needs a human (or Claude) after autowire: display controls with no
+    sync (values), and input controls with no action (triggers). The checklist the
+    phone-editor handoff works down."""
+    no_sync: list[str] = []
+    no_action: list[str] = []
+
+    def check(ch: dict):
+        t = ch.get("type")
+        if t in DISPLAY_TYPES and not ch.get("sync"):
+            no_sync.append(ch.get("id") or "?")
+        if t in INPUT_TYPES and not ch.get("action"):
+            no_action.append(ch.get("id") or "?")
+
+    for tab in layout.get("tabs", []):
+        _walk(tab.get("children"), check)
+    return {"values": no_sync, "triggers": no_action}
 
 
 def live_data_lint(layout: dict, known_paths) -> list[dict]:

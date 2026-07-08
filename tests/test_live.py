@@ -1,8 +1,8 @@
 """Tests for the live-mesh trio: simulate, probe, autowire (pure parts)."""
 
-import autowire
-import probe
-import simulate
+from carter_mcp import autowire
+from carter_mcp import probe
+from carter_mcp import simulate
 
 
 # ─── simulate ────────────────────────────────────────────────────────────────

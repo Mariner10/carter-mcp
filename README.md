@@ -25,19 +25,35 @@ device as it works.
 - **Wires to your data** — probe a running service's traffic, auto-wire controls
   to it, infer a layout from a schema, generate service/adapter stubs, and lint a
   draft against real frames.
-- 58 tools in total, exposed over stdio via `FastMCP` under the name `carter`.
+- 57 tools in total, exposed over stdio via `FastMCP` under the name `carter`.
 
 ## Install
 
 Requires Python 3.11+.
 
 ```bash
-pip install -r requirements.txt
+pip install -e .        # or: pip install -r requirements.txt
 ```
 
 This pulls [`carterkit`](https://pypi.org/project/carterkit/) (the layout-authoring
 engine — catalog, buffer, grid, validation, codegen, theming), which brings
 `meshsocket` transitively, plus the `mcp` SDK and `qrcode`.
+
+## Repo layout
+
+```
+server.py            stdio entry point (what MCP registrations run)
+carter_mcp/          the server package
+  app.py             FastMCP instance + session instructions
+  state.py           mutable per-session state
+  mesh.py            connection runtime: local relay, QR, routed RPC
+  protocol.py        pure wire-protocol builders/formatters (device-free tests)
+  content.py         resolved docs/catalog content, default spans
+  sources.py         live definition/demo sources + drift detection
+  tools/             the 57 MCP tools, grouped: docs, buffer, session,
+                     device, wiring, generators
+tests/               pytest suite (pure logic — no device or network needed)
+```
 
 ## Run it from an MCP client
 
@@ -61,13 +77,14 @@ a layout, show you a QR to pair your device, and push the layout live.
 To run it directly for a smoke test:
 
 ```bash
-python server.py   # serves MCP on stdio
+python server.py          # serves MCP on stdio
+python -m carter_mcp      # same thing
 ```
 
 ## Where the knowledge comes from
 
 The MCP is a thin tool layer over the *current* truth, not a vendored copy of it
-(see [`sources.py`](sources.py)):
+(see [`carter_mcp/sources.py`](carter_mcp/sources.py)):
 
 - **Control definitions** (the catalog + doc prose) are fetched from the website
   — `carterbeaudoin.net/CAR-TER/catalog.json` — cached on disk with a TTL.
@@ -104,9 +121,14 @@ python -m pytest -q
 
 ## Notes
 
-- The sample-layout tools read layouts bundled beside the CAR-TER app repo in the
-  original workspace; in a standalone checkout that set is simply empty — build
-  layouts from the catalog and examples instead.
+- The sample-layout tools read the layouts bundled with the CAR-TER app repo when
+  this repo sits beside it in the CAR-TER workspace (as it does in development).
+  In a standalone checkout that set is simply empty — build layouts from the
+  catalog and examples instead.
+- Tool failures (bad JSON, validation errors, not-connected, timeouts) are
+  returned as plain explanatory text with the MCP `isError` flag left false —
+  deliberate, so the model reads and reacts to the message instead of a client
+  short-circuiting on the flag. Don't key automation on `isError`.
 
 ## License
 

@@ -57,8 +57,7 @@ HTTP_TIMEOUT = int(os.environ.get("CARTER_HTTP_TIMEOUT", "12"))
 _USER_AGENT = "carter-mcp/sources"
 
 # Repo-relative last-resort copy of the docs (only meaningful in the dev workspace).
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_REPO_CONTROLDOCS = _PROJECT_ROOT / "CAR-TER" / "CAR-TER" / "ControlDocs"
+from carter_mcp.paths import REPO_CONTROLDOCS as _REPO_CONTROLDOCS
 
 _BUNDLE_CACHE = CACHE_DIR / "catalog.json"
 _META_CACHE = CACHE_DIR / "catalog.meta.json"
@@ -404,7 +403,11 @@ def format_status(status: dict) -> str:
 
     lines.append("")
     if status["aligned"]:
-        lines.append("✅ **Aligned** — website, carterkit, and device agree.")
+        # Only claim the device leg when a device was actually read back.
+        who = ("website, carterkit, and device agree" if d else
+               "website and carterkit agree — no device paired, so the app leg "
+               "wasn't checked (pair one and re-run to verify)")
+        lines.append(f"✅ **Aligned** — {who}.")
     else:
         lines.append("⚠️ **Drift detected:**")
         for i in status["issues"]:
