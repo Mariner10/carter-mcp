@@ -92,6 +92,33 @@ Reply:
 ```
 `values` is the device's `controlValues` map serialized to JSON.
 
+### `set-control-state`  (drive any control by id)
+The dual of `get-control-state`, and the **only** wire path to a control that has no
+`sync` binding — which is what makes a demo-style layout (no `connection`, no `sync`)
+drivable at all. Triggers/feeds describe the wire contract; this addresses the device.
+
+Request payload:
+```json
+{ "values": { "battery": 82, "status-light": "green", "trend": [1, 2, 3] } }
+```
+Reply:
+```json
+{ "ok": true, "applied": ["battery", "status-light"], "skipped": ["trend"] }
+```
+Each value is routed by the target control's **declared type**, exactly the way a real
+server frame is routed: scalars into `controlValues`; an array of numbers appends to a
+`sparkline`; an array of objects fills a `list`; a value for a `logConsole` appends a
+line; an object/array for a scalar control (graph, chart, board) is delivered as the JSON
+string that control parses.
+
+An id the layout doesn't contain — or a value shape the control can't use — is
+**skipped, not an error**: a partially-unknown push still replies `ok: true`. The
+`applied`/`skipped` split is truthful, decided by the same routing the write itself
+uses, so an id the device is about to ignore is never reported as applied.
+
+These writes are **wire-originated**: they do not emit a Studio Mirror `value` event
+(see below), because echoing them would send a value straight back to whoever pushed it.
+
 ### `get-connection-status`
 Read the device's relay connection state.
 
@@ -192,6 +219,69 @@ control's props. The user edits and taps **"Send to Editor"**.
 ```
 The MCP receives it via `@socket.on("control-edit-response")` (the device emits it with
 plain `send`, which the relay fans out to channel peers — the same pattern chat uses).
+
+## Studio Mirror (device → editor broadcasts)
+
+The other direction of the live-edit channel: while a Studio Session is active the phone
+**narrates what the user is doing** so an editor can mirror it. Consumed today by
+`carterkit explore` (the Device Mirror panel); any channel peer may listen.
+
+The premise is the session's connection override: during a session the **studio socket is
+authoritative and overrides every layout-level connection**. Layouts the user opens register
+their sync/action/read-back wiring on the studio socket and their own `connection` block is
+never dialed — so the user can navigate the app normally and stay attached to the editor.
+These events are how the editor finds out where they went. (Device side:
+`CAR-TER/App/AppState+StudioMirror.swift`.)
+
+Every frame is a broadcast — `broadcast_request` with `"msg_type": "studio.event"` — carrying
+a **flat** `event` discriminator alongside its fields:
+
+```json
+{ "msg_type": "studio.event", "event": "tab", "tab": "Power", "title": "Power", "index": 0 }
+```
+
+| `event` | Fields | Emitted when |
+|---|---|---|
+| `hello` | `device` (string), `appVersion` (string), `layout` (string \| null — layout name) | the studio socket connects, and on every broadcast-listener re-arm |
+| `layout` | `layout` (string — name), `layoutId` (string \| null — file name), `tabs` (array of `{id, title}`), `controls` (int — control count), `tab` (string — initially-selected tab id) | a layout finishes loading during the session |
+| `layout-closed` | — | the active layout was torn down **without a replacement** (back to the blank studio screen) |
+| `tab` | `tab` (string — tab id), `title` (string), `index` (int) | the user switches tabs |
+| `action` | `control` (string — control id), `controlType` (string), `payload` (object — the substituted action payload as sent) | any control action fires |
+| `value` | `control` (string), `value` (scalar/JSON) | the user edits a control's value |
+| `bye` | — | the session ends (`stopLiveEditSession`) |
+
+No timestamps ride the wire — a consumer stamps arrival itself (the explorer's SSE layer
+adds `ts`). A tab id is the tab's **title** (the app's `TabDefinition.id == title`).
+
+### `hello` + `layout` are a repeating announcement, not a handshake
+
+They are emitted together, and emitted **again** on every broadcast-listener arm/re-arm *and*
+every confirmed socket connect — including MeshSocket's own transport auto-reconnects.
+Consumers **MUST** be idempotent about them and **MUST NOT** treat the first `hello` as a
+once-per-session event.
+
+This is deliberate. A frame emitted while the socket is still dialing is dropped (the device
+only broadcasts on a connected socket), and `connect()` returning does not mean the socket has
+identified — so an announcement made in that window is silently lost. Re-announcing on the
+*confirmed* connect is what guarantees the editor's mirror fills in, rather than staying blank
+until the user happens to navigate.
+
+A consumer that attached late (or restarted) and has heard nothing yet should not wait: the
+same facts are available by request/response — `get-current-layout` for the layout, its tabs
+and control count, `get-device-info` for `appVersion` — and the roster for the device name.
+Anything derived that way is an inference and **MUST** yield to a real `studio.event` when one
+arrives. (`carterkit`'s explorer does exactly this in `Explorer.prime_mirror`.)
+
+### `value` is user-originated only
+
+A `value` event means **a person touched that control** — a slider drag ending, a toggle, a
+text commit. Values arriving from the wire (a server's sync push) are never echoed: doing so
+would feed a value straight back to the sender that pushed it. Consecutive edits to one control
+are coalesced to ≥100 ms, so a drag reports a first and a last sample rather than every frame.
+
+`action` is likewise purely additive narration — the control's authored action is dispatched
+unchanged and separately, so an editor watching both sees the mirror frame *and* the real
+action frame. Deduplicate on `control` + `payload` if you flash a UI on each.
 
 ## Out of scope (this contract)
 

@@ -113,8 +113,9 @@ async def connect(channel: str = "editor", role: str = "editor",
 
     return f"""Connected — {transport_note}.
 Channel '{channel}'. QR saved to: {qr_path}
-In CAR-TER, open Live Edit and scan this QR to pair (the app pairs by camera scan;
-there is no paste-the-code field).
+In CAR-TER, start a Studio Session (Settings → Studio Session → Open Scanner, or
+the layout picker's "Start a Studio Session") and scan this QR to pair (the app
+pairs by camera scan; there is no paste-the-code field).
 
 QR payload contents (for reference / to regenerate the QR — not something you type
 into the app):

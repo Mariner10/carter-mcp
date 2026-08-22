@@ -63,7 +63,7 @@ def format_current_layout(resp: dict) -> str:
     if resp.get("activeFile"):
         header_bits.append(f"file `{resp['activeFile']}`")
     if resp.get("isLiveEditSession"):
-        header_bits.append("live-edit session")
+        header_bits.append("Studio Session")
     header = (" · ".join(header_bits) + "\n") if header_bits else ""
     body = format_summary(summary)
     full = resp.get("layout")

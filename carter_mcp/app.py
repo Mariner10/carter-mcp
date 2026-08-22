@@ -29,8 +29,9 @@ Workflow:
    get_control_catalog for the machine-readable schema in one call.
 3. Use get_layout_schema for the overall layout structure; get_sample_layout and
    get_control_example for real, ready-to-tweak snippets.
-4. Use connect to pair with a device — the user scans the QR code in CAR-TER
-   (Settings → Live Edit / scan). Then get_device_info to confirm the app version.
+4. Use connect to pair with a device — the user starts a Studio Session in CAR-TER
+   (Settings → Studio Session → Open Scanner) and scans the QR code. Then
+   get_device_info to confirm the app version.
 5. Build a layout JSON and push_layout to see it live on the device.
 6. Iterate — each push_layout updates the device instantly. If a control or field
    is ignored on the phone, re-run check_sources: the app is likely older than the

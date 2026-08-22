@@ -223,7 +223,7 @@ async def customize_on_phone(control_json: str, timeout: int = 120,
 
     "Shape it on glass, wire it on the model": the human does the look/feel, you do the
     plumbing. The user taps "Send to Editor" on the phone to return the control.
-    Requires a paired device in a live-edit session (connect + scan QR).
+    Requires a paired device in a Studio Session (connect + scan QR).
 
     Args:
         control_json: The control to hand off (e.g. {"type":"gauge","label":"Battery"}).
@@ -271,7 +271,7 @@ async def customize_on_phone(control_json: str, timeout: int = 120,
 
     if not edited:
         return (f"No response within {timeout}s — the configurator may not have opened "
-                f"(is the device in a live-edit session?) or the user didn't tap 'Send to Editor'.")
+                f"(is the device in a Studio Session?) or the user didn't tap 'Send to Editor'.")
 
     pretty = json.dumps(edited, indent=2)
     if add_to_buffer:
