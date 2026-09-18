@@ -19,11 +19,13 @@ Two patterns, both already in production for the existing `list-layouts` / `save
 
 ## Device prerequisite (Track-1 / Swift) — ✅ landed
 
-> The routed responders below are installed by `registerRequestHandlers()`, which runs in
-> **both** the connected-layout load path **and** the QR live-edit session
-> (`startLiveEditSession` → `registerRequestHandlers()`), with each verb tracked in
-> `activeListenerEvents` for clean teardown. All verbs — including `get-device-info` — are
-> armed and answer during live edit (verified end-to-end; see `e2e-walkthrough/`). An app
+> The routed responders below are installed per socket: `registerRequestHandlers()` arms
+> them on the **layout** socket in the connected-layout load path (tracked in
+> `activeListenerEvents`), and `registerStudioRequestHandlers()` arms them — plus
+> `watch-traffic`, `provision-device`, and `get-provision-result` — on the **studio**
+> socket at session start (tracked in
+> `studioListenerEvents`, session-scoped: they survive every layout swap and die with the
+> session). All verbs — including `get-device-info` — answer during live edit. An app
 > build predating this still times out on these verbs, which the MCP surfaces as a drift hint.
 
 ## Routed verbs (MCP → device, with reply)
@@ -124,18 +126,29 @@ Read the device's relay connection state.
 
 Request payload: `null`
 
-Reply:
+Reply (device protocol **v2** — since the studio/layout connection split, the
+top-level fields describe the **layout link**: the loaded layout's own
+`connection` on the device's layout socket. The paired editor's link is the
+separate `studio` object, present only while a Studio Session is live):
 ```json
 {
   "ok": true,
-  "connected": true,
-  "phase": "connected" | "connecting" | "failed" | "idle",
-  "channel": "editor-abc",
-  "role": "viewer",
-  "account": "acct-1" | null,     // from the relay token's acct claim
-  "listening": ["broadcast", "list-layouts", "get-current-layout", ...]  // activeListenerEvents
+  "connected": true,                       // the LAYOUT socket
+  "phase": "connected" | "connecting" | "failed" | "idle" | "reconnecting",
+  "channel": "lights" | null,              // the layout's own channel (null: no connection block)
+  "role": "controller" | null,
+  "account": "acct-1" | null,              // from the layout's relay token's acct claim
+  "listening": ["broadcast", "list-layouts", ...],   // layout-socket listeners
+  "studio": {                              // ONLY during a Studio Session
+    "connected": true,
+    "phase": "connected",
+    "channel": "editor-abc",
+    "watchTraffic": false                  // is the wire tap currently enabled
+  }
 }
 ```
+On protocol **v1** apps the fields describe whichever single socket was active
+(the studio one during a session) and `studio` is absent; the MCP renders either.
 
 ### `get-device-info`  (version / drift detection)
 Report which CAR-TER app build the device is running so the editor can detect when
@@ -182,6 +195,104 @@ Reply — device rejected (decode/apply failed):
 The device MUST reply `ok:false` with an `error` when it cannot decode/apply the layout, rather
 than rendering nothing and letting the editor assume success.
 
+**Since the connection split (protocol v2):** a pushed layout that carries a `connection`
+block is **dialed immediately on the device's layout socket** — the studio session no
+longer suppresses or substitutes for it, and its data starts flowing while the session
+stays paired. A pushed layout without a `connection` is studio-only: rendered and drivable
+via `set-control-state`, but with no layout wiring registered anywhere (a `simulate`d
+broadcast on the studio channel no longer reaches its controls — drive by id instead).
+
+### `watch-traffic`  (studio wire tap — protocol v2)
+Ask the device to forward the live sync values it dispatches to controls. **Studio-socket
+only** — the verb is armed with the session and auto-disables when the session ends.
+
+Request payload:
+```json
+{ "enable": true, "sample_ms": 250, "filter": "batt" }   // sample_ms, filter optional
+```
+- `sample_ms` — per-control sampling window (default 250, floor 100): at most one
+  forwarded frame per control per window.
+- `filter` — case-insensitive control-id substring; non-matching controls are not forwarded.
+
+Reply:
+```json
+{ "ok": true, "enabled": true, "sample_ms": 250 }
+```
+
+While enabled, the device broadcasts one frame per sampled dispatch **on the studio
+channel** (`broadcast_request`):
+```json
+{
+  "msg_type": "studio.traffic",
+  "control": "battery",          // the control the value landed on
+  "event": "broadcast",          // the sync registration's event
+  "valuePath": "batt.pct",       // omitted when the registration has none
+  "value": 82,                   // post-decrypt, pre-render; truncated to 1KB
+  "frameMsgType": "telemetry",   // the incoming frame's msg_type, when present
+  "truncated": true              // only when the 1KB cap bit
+}
+```
+The tap point is the device's sync dispatcher, so this is exactly what the layout's
+controls are being fed — **after** E2EE decrypt, **before** render — which is what makes
+it the editor's live-data eyes without room credentials or keys ever leaving the device.
+The MCP tool `watch_traffic(seconds, filter)` enables the tap, collects for a window,
+disables it, and returns a per-control digest (last value + rate).
+
+### `provision-device` + `get-provision-result`  (hub credential mint, human-gated)
+Mint a Hub credential for a channel through the phone — the studio-session version of
+**Add Device**. **Studio-socket only**, and every mint is gated by an approval sheet on
+the device: no tap, no credential.
+
+Because the relay caps a routed reply at ~5s, the (up to 60s) human approval can never
+ride the arming request. The exchange is two verbs — arm, then poll (the same pull
+pattern as `get-pending-edit`):
+
+`provision-device` request payload:
+```json
+{ "channel": "lights", "role": "hub", "reuse_room_key": true }  // role, reuse optional
+```
+Immediate reply — armed:
+```json
+{ "ok": true, "status": "pending", "request_id": "<uuid>" }
+```
+or a structured error (never a half-minted credential): `{ "error": <code>, "reason": "…" }`
+with codes `bad-request` (missing/empty channel, bad role), `no-connect-session` (the
+device has no Connect+ session token), `busy` (an approval sheet is already up).
+
+`get-provision-result` request payload: `{ "request_id": "<uuid>" }`. Replies:
+- `{ "ok": true, "status": "pending" }` — sheet still up, or the mint is in flight;
+- `{ "error": "denied", "reason": "user-denied" | "timeout" | "dismissed" }` — the owner
+  denied, swiped the sheet away, or let the 60s timeout lapse;
+- `{ "error": "mint-failed", "reason": "…" }` — approved, but the validator call failed;
+- `{ "error": "unknown-request" }` — unknown id, session ended, or the result was
+  **already drained** (each result is handed out exactly once);
+- on success:
+```json
+{
+  "ok": true, "request_id": "<uuid>",
+  "credential": { "url": "wss://…", "channel": "lights", "token": "…", "role": "hub",
+                  "refresh": "…", "did": "dv_…", "validator": "https://…", "k": "…" },
+  "key_reuse": "reused-existing" | "fresh-channel-had-none" | "fresh-forced",
+  "expires_at": 1756000000
+}
+```
+The `credential` is byte-for-byte the shape Add Device exports (`DeviceClient.Minted.
+credentialExportObject` — field names are wire API). `k` follows room-key continuity:
+`reuse_room_key: true` (default) reuses the channel's key when the device knows one
+(loaded layout → saved layouts on disk → membership credential → a prior mint this run)
+and generates a fresh 32-byte key only when the channel has none; `false` forces fresh.
+
+**Secrets stay on disk.** The MCP tool `provision_device(channel, out_path, …)` writes
+the credential JSON verbatim to `out_path` (mode `0600`, parent dirs created, refuses to
+overwrite without `overwrite=True`, and warns loudly when an overwrite changes a
+channel's `k`). The tool result carries ONLY non-secret metadata — did, channel, role,
+token expiry, relay host, out_path, key-reuse verdict. `token`/`refresh`/`k` must never
+appear in any tool result: the credential travels device → editor over the local studio
+relay and lands in the file, mirroring the `layout_path` philosophy in reverse.
+
+Debug-only harness: `AUTO_APPROVE_PROVISION=1` auto-approves the sheet (sims can't tap);
+`AUTO_MINT_STUB=1` answers the mint HTTP call locally. Both `#if DEBUG`, never shipped.
+
 ## Broadcast verbs (unchanged, MCP → all viewers)
 
 Kept as-is for the multi-viewer / demo path. Used by `push_layout` only when **no** single device
@@ -226,12 +337,13 @@ The other direction of the live-edit channel: while a Studio Session is active t
 **narrates what the user is doing** so an editor can mirror it. Consumed today by
 `carterkit explore` (the Device Mirror panel); any channel peer may listen.
 
-The premise is the session's connection override: during a session the **studio socket is
-authoritative and overrides every layout-level connection**. Layouts the user opens register
-their sync/action/read-back wiring on the studio socket and their own `connection` block is
-never dialed — so the user can navigate the app normally and stay attached to the editor.
-These events are how the editor finds out where they went. (Device side:
-`CAR-TER/App/AppState+StudioMirror.swift`.)
+The premise (since the connection split, protocol v2) is **two coexisting sockets**: the
+session runs on its own studio socket while every layout the user opens or the editor
+pushes **dials its own `connection` on the device's layout socket** — the phone is in the
+room AND paired with the editor at the same time. Mirror events ride the studio socket
+only; layout wiring (sync/action/state-sync) rides the layout socket only. The user
+navigates the app normally and stays attached to the editor, and these events are how the
+editor finds out where they went. (Device side: `CAR-TER/App/AppState+StudioMirror.swift`.)
 
 Every frame is a broadcast — `broadcast_request` with `"msg_type": "studio.event"` — carrying
 a **flat** `event` discriminator alongside its fields:

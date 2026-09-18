@@ -88,11 +88,17 @@ def format_control_state(resp: dict) -> str:
 
 
 # ─── get-connection-status ────────────────────────────────────────────────────
+#
+# Since the studio/layout connection split (device protocol v2), the top-level
+# fields describe the LAYOUT link — the layout's own connection on the device's
+# layout socket — and a `studio` object (present only during a Studio Session)
+# describes the paired editor link. Older apps report a single conflated link;
+# the formatter renders whatever is there.
 
 def format_connection_status(resp: dict) -> str:
     connected = resp.get("connected", False)
     phase = resp.get("phase", "?")
-    state = "Connected" if connected else "Not connected"
+    state = "Layout link: connected" if connected else "Layout link: not connected"
     lines = [f"{state} (phase: {phase})"]
     if resp.get("channel"):
         lines.append(f"  channel: {resp['channel']} · role: {resp.get('role','?')}")
@@ -101,6 +107,15 @@ def format_connection_status(resp: dict) -> str:
     listening = resp.get("listening") or []
     if listening:
         lines.append(f"  listening: {', '.join(listening)}")
+    studio = resp.get("studio")
+    if isinstance(studio, dict):
+        s_state = "paired" if studio.get("connected") else f"not connected (phase: {studio.get('phase','?')})"
+        line = f"Studio link: {s_state}"
+        if studio.get("channel"):
+            line += f" · channel: {studio['channel']}"
+        if studio.get("watchTraffic"):
+            line += " · wire tap ON"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -185,6 +200,78 @@ def build_control_edit_request(control: dict) -> dict:
     return {"msg_type": "control-edit-request", "control": control}
 
 
+# ─── watch-traffic (studio wire tap) ──────────────────────────────────────────
+#
+# Routed `watch-traffic {enable, sample_ms?, filter?}` on the STUDIO socket asks
+# the device to forward every layout-socket sync value it dispatches (post-decrypt,
+# pre-render) back to the editor as `studio.traffic` broadcasts — live-data eyes
+# through the device without the editor ever holding room credentials or E2EE keys.
+# Sampled per control (>=250ms default) and truncated (1KB/value) device-side.
+
+TRAFFIC_MSG_TYPE = "studio.traffic"
+
+
+def build_watch_traffic_request(enable: bool, sample_ms: int = 250,
+                                filter: str = "") -> dict:
+    req: dict = {"enable": enable, "sample_ms": sample_ms}
+    if filter:
+        req["filter"] = filter
+    return req
+
+
+def extract_traffic_frame(payload) -> Optional[dict]:
+    """A broadcast payload → a traffic record, or None if it isn't one."""
+    if not isinstance(payload, dict) or payload.get("msg_type") != TRAFFIC_MSG_TYPE:
+        return None
+    if not isinstance(payload.get("control"), str):
+        return None
+    return payload
+
+
+def aggregate_traffic(frames: list, seconds: float) -> dict:
+    """Per-control digest of collected traffic frames:
+    {control: {count, rate_hz, last, valuePath?, event?, frameMsgType?, truncated}}."""
+    out: dict = {}
+    span = max(0.001, float(seconds))
+    for f in frames:
+        control = f["control"]
+        entry = out.setdefault(control, {"count": 0, "truncated": False})
+        entry["count"] += 1
+        entry["last"] = f.get("value")
+        for key in ("valuePath", "event", "frameMsgType"):
+            if f.get(key) is not None:
+                entry[key] = f[key]
+        if f.get("truncated"):
+            entry["truncated"] = True
+    for entry in out.values():
+        entry["rate_hz"] = round(entry["count"] / span, 2)
+    return out
+
+
+def format_traffic_digest(digest: dict, seconds: float, frame_count: int) -> str:
+    if not digest:
+        return (f"No sync traffic observed in {seconds}s. Either the layout's server/"
+                f"hub isn't sending, no control's sync filter matched, or the layout "
+                f"has no live connection — check get_connection_status (hub presence) "
+                f"and the layout's sync wiring.")
+    lines = [f"Observed {frame_count} forwarded value(s) across "
+             f"{len(digest)} control(s) over {seconds}s:"]
+    for control in sorted(digest):
+        e = digest[control]
+        bits = [f"last={json.dumps(e.get('last'))}"]
+        bits.append(f"{e['count']}x ({e['rate_hz']}/s)")
+        if e.get("valuePath"):
+            bits.append(f"path {e['valuePath']}")
+        if e.get("frameMsgType"):
+            bits.append(f"msg_type {e['frameMsgType']}")
+        if e.get("truncated"):
+            bits.append("TRUNCATED to 1KB")
+        lines.append(f"- **{control}**: " + " · ".join(bits))
+    lines.append("(Sampled device-side — per-control rate is capped by sample_ms, "
+                 "so rates read as 'at least'.)")
+    return "\n".join(lines)
+
+
 def extract_edited_control(payload) -> Optional[dict]:
     """Pull the user-edited control out of a control-edit-response payload. Accepts
     either the wrapper ({msg_type, control}) or a bare control object."""
@@ -196,3 +283,100 @@ def extract_edited_control(payload) -> Optional[dict]:
     if "type" in payload:  # already the bare control
         return {k: v for k, v in payload.items() if k != "msg_type"}
     return None
+
+
+# ─── provision-device (hub credential mint, human-gated) ──────────────────────
+#
+# Routed `provision-device {channel, role?, reuse_room_key?}` on the STUDIO socket
+# arms an approval sheet on the phone and answers `{ok, status:"pending",
+# request_id}` immediately (the relay caps a routed reply at ~5s — a 60s human
+# approval can never ride the arming request). The editor then polls the routed
+# `get-provision-result {request_id}` until the outcome lands. The credential is
+# written straight to disk by the tool; NONE of its secrets (token / refresh / k)
+# may ever appear in a tool result. Wire contract: PROTOCOL.md.
+
+#: The credential's secret fields — never allowed into a tool result.
+PROVISION_SECRET_FIELDS = ("token", "refresh", "k")
+
+
+def build_provision_request(channel: str, role: str = "hub",
+                            reuse_room_key: bool = True) -> dict:
+    return {"channel": channel, "role": role, "reuse_room_key": reuse_room_key}
+
+
+def build_provision_result_request(request_id: str) -> dict:
+    return {"request_id": request_id}
+
+
+def extract_provision_pending(resp) -> Optional[str]:
+    """The request_id from a `{ok, status:"pending", request_id}` arming reply."""
+    if (isinstance(resp, dict) and resp.get("ok")
+            and resp.get("status") == "pending"
+            and isinstance(resp.get("request_id"), str)):
+        return resp["request_id"]
+    return None
+
+
+def provision_error_message(resp) -> Optional[str]:
+    """A human-readable line for a structured `{error, reason}` provision reply,
+    or None when the reply isn't an error."""
+    if not isinstance(resp, dict) or "error" not in resp:
+        return None
+    error = resp.get("error")
+    reason = resp.get("reason", "")
+    explain = {
+        "denied": "The owner denied the request on the device (or it timed out unanswered).",
+        "busy": "The device already has an approval sheet up — retry after it resolves.",
+        "no-connect-session": "The device has no active Connect+ session — the owner must sign in / restore Connect+ first.",
+        "mint-failed": "The device's mint call failed.",
+        "bad-request": "The device rejected the request shape.",
+        "unknown-request": "The device no longer knows this request (session ended, or the result was already drained).",
+    }.get(error, f"Device returned error '{error}'.")
+    return f"{explain}" + (f" ({reason})" if reason and reason != error else "")
+
+
+def provision_key_change_warning(old_text: str, new_credential: dict) -> Optional[str]:
+    """Loud warning when overwriting a credential whose `k` (same channel) differs —
+    a changed room key breaks every layout pinning the old one."""
+    try:
+        old = json.loads(old_text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(old, dict):
+        return None
+    if old.get("channel") != new_credential.get("channel"):
+        return None
+    old_k, new_k = old.get("k"), new_credential.get("k")
+    if not old_k or old_k == new_k:
+        return None
+    return ("⚠️ ROOM KEY CHANGED: the overwritten file held a different E2EE key for "
+            f"channel '{old.get('channel')}'. Every layout pinning the old key can no "
+            "longer read this hub's frames — update those layouts, or re-provision "
+            "with reuse_room_key=True from a device that still knows the old key.")
+
+
+def format_provision_summary(credential: dict, out_path: str, key_verdict: str,
+                             expires_at=None, warning: Optional[str] = None) -> str:
+    """The redacted tool result: did, channel, role, token expiry, url host,
+    out_path, and the key-reuse verdict — and NOTHING from the secret fields."""
+    from urllib.parse import urlparse
+    host = urlparse(credential.get("url", "")).netloc or credential.get("url", "?")
+    verdict = {
+        "reused-existing": "reused the channel's existing room key",
+        "fresh-channel-had-none": "generated a fresh room key (channel had none)",
+        "fresh-forced": "generated a fresh room key (reuse_room_key=False)",
+    }.get(key_verdict, key_verdict or "no key verdict reported")
+    lines = [
+        "Hub credential provisioned and written to disk (secrets stay in the file — "
+        "never in this result).",
+        f"- device id: {credential.get('did', '?')}",
+        f"- channel: {credential.get('channel', '?')} · role: {credential.get('role', '?')}",
+        f"- relay host: {host}",
+        f"- room key: {verdict}",
+        f"- written to: {out_path} (mode 0600)",
+    ]
+    if expires_at:
+        lines.insert(4, f"- token expires at: {expires_at} (unix; the hub self-refreshes)")
+    if warning:
+        lines.append(warning)
+    return "\n".join(lines)

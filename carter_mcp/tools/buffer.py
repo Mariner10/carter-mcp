@@ -17,6 +17,7 @@ from carterkit.buffer import BufferError, LayoutBuffer
 
 from carter_mcp import content, mesh, state
 from carter_mcp.app import mcp
+from carter_mcp.layoutio import load_layout_arg
 from carter_mcp.paths import SAMPLE_LAYOUTS_DIR
 
 
@@ -24,6 +25,7 @@ from carter_mcp.paths import SAMPLE_LAYOUTS_DIR
 async def begin_edit(name: str = "Untitled", columns: int = 4, rows: int = 8,
                      accent: str = "#667eea", from_sample: str = "",
                      from_device: bool = False, from_device_file: str = "",
+                     from_file: str = "",
                      mode: Optional[str] = None, row_height: Optional[int] = None) -> str:
     """Start (or restart) the working layout buffer for incremental editing.
 
@@ -48,7 +50,18 @@ async def begin_edit(name: str = "Untitled", columns: int = 4, rows: int = 8,
         from_device: Seed from the layout currently live on the paired device (read-modify-write).
         from_device_file: Seed from a SAVED layout on the device by filename or
             display name (the phone-editor handoff), whether or not it's active.
+        from_file: Seed from a layout .json file on disk (any path) — the file
+            never transits the model.
     """
+    if from_file:
+        layout, err = load_layout_arg(layout_path=from_file)
+        if err:
+            return err
+        try:
+            state.work_buffer = LayoutBuffer.from_layout(layout)
+        except BufferError as e:
+            return f"'{from_file}' couldn't be loaded into the buffer: {e}"
+        return (f"Buffer seeded from {from_file}.\n\n" + state.work_buffer.summary())
     if from_device_file:
         if mesh.connection_error():
             return "Not connected — can't read the device. Call connect first."
@@ -300,17 +313,21 @@ def discard_buffer() -> str:
 
 
 @mcp.tool()
-def validate_layout(layout_json: str) -> str:
+def validate_layout(layout_json: str = "", layout_path: str = "") -> str:
     """Lint a layout against the control schema WITHOUT pushing it: duplicate ids,
     unknown control types, unknown/bad-enum fields, and grid overlaps/out-of-bounds.
 
+    With layout_path this is the compiler-check for on-disk layouts: lint the
+    file, then hand the same path to push_layout / save_device_layout — the
+    document never transits the model.
+
     Args:
         layout_json: Complete layout JSON string.
+        layout_path: Path to a layout .json file on disk (alternative to layout_json).
     """
-    try:
-        layout = json.loads(layout_json)
-    except json.JSONDecodeError as e:
-        return f"Invalid JSON: {e}"
+    layout, err = load_layout_arg(layout_json, layout_path)
+    if err:
+        return err
     return validate.format_findings(
         validate.validate_layout(layout, content.build_catalog(include_theme=True)))
 

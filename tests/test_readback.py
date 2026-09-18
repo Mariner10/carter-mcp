@@ -165,3 +165,78 @@ def test_push_uses_routed_when_single_device():
 def test_push_uses_broadcast_when_no_device():
     # No resolvable target → fall back to broadcast layout-update (multi-viewer / demo path).
     assert protocol.should_push_routed(device_id=None) is False
+
+
+# ─── connection split: studio object ─────────────────────────────────────────
+
+def test_format_connection_status_renders_studio_link():
+    resp = {
+        "ok": True, "connected": True, "phase": "connected",
+        "channel": "lights", "role": "controller", "account": None,
+        "listening": ["broadcast"],
+        "studio": {"connected": True, "phase": "connected",
+                   "channel": "editor-abc", "watchTraffic": True},
+    }
+    out = protocol.format_connection_status(resp)
+    assert "Layout link" in out
+    assert "lights" in out
+    assert "Studio link: paired" in out
+    assert "editor-abc" in out
+    assert "wire tap ON" in out
+
+
+def test_format_connection_status_v1_has_no_studio_line():
+    resp = {"ok": True, "connected": True, "phase": "connected",
+            "channel": "editor-abc", "role": "viewer", "listening": []}
+    out = protocol.format_connection_status(resp)
+    assert "Studio link" not in out
+
+
+# ─── watch-traffic (studio wire tap) ─────────────────────────────────────────
+
+def test_build_watch_traffic_request_shapes():
+    assert protocol.build_watch_traffic_request(True) == {"enable": True, "sample_ms": 250}
+    assert protocol.build_watch_traffic_request(False) == {"enable": False, "sample_ms": 250}
+    assert protocol.build_watch_traffic_request(True, sample_ms=500, filter="batt") == {
+        "enable": True, "sample_ms": 500, "filter": "batt"}
+
+
+def test_extract_traffic_frame_accepts_only_traffic():
+    good = {"msg_type": "studio.traffic", "control": "cpu", "value": 42}
+    assert protocol.extract_traffic_frame(good) == good
+    assert protocol.extract_traffic_frame({"msg_type": "telemetry", "cpu": 42}) is None
+    assert protocol.extract_traffic_frame({"msg_type": "studio.traffic"}) is None
+    assert protocol.extract_traffic_frame("nope") is None
+
+
+def test_aggregate_traffic_digest():
+    frames = [
+        {"msg_type": "studio.traffic", "control": "cpu", "value": 40,
+         "valuePath": "cpu", "event": "broadcast", "frameMsgType": "telemetry"},
+        {"msg_type": "studio.traffic", "control": "cpu", "value": 55,
+         "valuePath": "cpu", "event": "broadcast", "frameMsgType": "telemetry"},
+        {"msg_type": "studio.traffic", "control": "log", "value": "boot ok",
+         "truncated": True},
+    ]
+    digest = protocol.aggregate_traffic(frames, seconds=10)
+    assert digest["cpu"]["count"] == 2
+    assert digest["cpu"]["last"] == 55
+    assert digest["cpu"]["rate_hz"] == 0.2
+    assert digest["cpu"]["valuePath"] == "cpu"
+    assert digest["log"]["truncated"] is True
+
+
+def test_format_traffic_digest_lists_controls_and_rates():
+    digest = protocol.aggregate_traffic(
+        [{"msg_type": "studio.traffic", "control": "cpu", "value": 55,
+          "valuePath": "cpu", "frameMsgType": "telemetry"}], seconds=5)
+    out = protocol.format_traffic_digest(digest, 5, 1)
+    assert "cpu" in out
+    assert "55" in out
+    assert "telemetry" in out
+
+
+def test_format_traffic_digest_empty_explains_causes():
+    out = protocol.format_traffic_digest({}, 10, 0)
+    assert "No sync traffic" in out
+    assert "get_connection_status" in out
