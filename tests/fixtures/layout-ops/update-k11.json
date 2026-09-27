@@ -1,0 +1,221 @@
+{
+  "batch": {
+    "author": "editor",
+    "ops": [
+      {
+        "id": "power",
+        "op": "update",
+        "set": {
+          "label": null,
+          "tint": "#00ff00"
+        },
+        "unset": []
+      }
+    ]
+  },
+  "description": "K11 update: set with null removes",
+  "expected": {
+    "glance": {
+      "hero": "temp",
+      "slots": [
+        "power"
+      ]
+    },
+    "name": "Ops Base",
+    "tabs": [
+      {
+        "children": [
+          {
+            "id": "temp",
+            "label": "Temp",
+            "position": [
+              0,
+              0
+            ],
+            "span": [
+              2,
+              2
+            ],
+            "type": "gauge"
+          },
+          {
+            "id": "power",
+            "position": [
+              0,
+              2
+            ],
+            "span": [
+              1,
+              2
+            ],
+            "tint": "#00ff00",
+            "type": "toggle"
+          },
+          {
+            "children": [
+              {
+                "id": "oil",
+                "label": "Oil",
+                "position": [
+                  0,
+                  0
+                ],
+                "type": "label"
+              }
+            ],
+            "grid": {
+              "columns": 2,
+              "rows": 2
+            },
+            "id": "engine",
+            "label": "Engine",
+            "position": [
+              2,
+              0
+            ],
+            "span": [
+              3,
+              4
+            ],
+            "type": "group"
+          },
+          {
+            "id": "note",
+            "label": "Shown when power",
+            "position": [
+              5,
+              0
+            ],
+            "type": "label",
+            "visible": {
+              "operator": "eq",
+              "value": true,
+              "when": "power"
+            }
+          }
+        ],
+        "grid": {
+          "columns": 4,
+          "rows": 8
+        },
+        "icon": "gauge",
+        "id": "t_main",
+        "title": "Main"
+      },
+      {
+        "children": [],
+        "grid": {
+          "columns": 2,
+          "rows": 4
+        },
+        "icon": "list.bullet",
+        "id": "t_more",
+        "title": "More"
+      }
+    ],
+    "version": 1
+  },
+  "input": {
+    "glance": {
+      "hero": "temp",
+      "slots": [
+        "power"
+      ]
+    },
+    "name": "Ops Base",
+    "tabs": [
+      {
+        "children": [
+          {
+            "id": "temp",
+            "label": "Temp",
+            "position": [
+              0,
+              0
+            ],
+            "span": [
+              2,
+              2
+            ],
+            "type": "gauge"
+          },
+          {
+            "id": "power",
+            "label": "Power",
+            "position": [
+              0,
+              2
+            ],
+            "span": [
+              1,
+              2
+            ],
+            "type": "toggle"
+          },
+          {
+            "children": [
+              {
+                "id": "oil",
+                "label": "Oil",
+                "position": [
+                  0,
+                  0
+                ],
+                "type": "label"
+              }
+            ],
+            "grid": {
+              "columns": 2,
+              "rows": 2
+            },
+            "id": "engine",
+            "label": "Engine",
+            "position": [
+              2,
+              0
+            ],
+            "span": [
+              3,
+              4
+            ],
+            "type": "group"
+          },
+          {
+            "id": "note",
+            "label": "Shown when power",
+            "position": [
+              5,
+              0
+            ],
+            "type": "label",
+            "visible": {
+              "operator": "eq",
+              "value": true,
+              "when": "power"
+            }
+          }
+        ],
+        "grid": {
+          "columns": 4,
+          "rows": 8
+        },
+        "icon": "gauge",
+        "id": "t_main",
+        "title": "Main"
+      },
+      {
+        "children": [],
+        "grid": {
+          "columns": 2,
+          "rows": 4
+        },
+        "icon": "list.bullet",
+        "id": "t_more",
+        "title": "More"
+      }
+    ],
+    "version": 1
+  },
+  "kit": true,
+  "name": "update-k11"
+}

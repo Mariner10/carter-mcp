@@ -1,0 +1,253 @@
+{
+  "batch": {
+    "author": "editor",
+    "ops": [
+      {
+        "id": "temp",
+        "op": "move",
+        "position": [
+          6,
+          0
+        ]
+      },
+      {
+        "hidden": true,
+        "id": "temp",
+        "op": "place",
+        "presentation": "landscape"
+      }
+    ]
+  },
+  "description": "placements.<id>.default keeps its shape; a new placement facet joins the id's entry",
+  "expected": {
+    "glance": {
+      "hero": "temp",
+      "slots": [
+        "power"
+      ]
+    },
+    "name": "Ops Base",
+    "placements": {
+      "temp": {
+        "default": {
+          "position": [
+            6,
+            0
+          ],
+          "span": [
+            2,
+            2
+          ]
+        },
+        "landscape": {
+          "hidden": true
+        }
+      }
+    },
+    "schemaVersion": 2,
+    "styles": {
+      "power": {
+        "tint": "#aa0000"
+      }
+    },
+    "tabs": [
+      {
+        "children": [
+          {
+            "id": "temp",
+            "label": "Temp",
+            "type": "gauge"
+          },
+          {
+            "id": "power",
+            "label": "Power",
+            "position": [
+              0,
+              2
+            ],
+            "span": [
+              1,
+              2
+            ],
+            "type": "toggle"
+          },
+          {
+            "children": [
+              {
+                "id": "oil",
+                "label": "Oil",
+                "position": [
+                  0,
+                  0
+                ],
+                "type": "label"
+              }
+            ],
+            "grid": {
+              "columns": 2,
+              "rows": 2
+            },
+            "id": "engine",
+            "label": "Engine",
+            "position": [
+              2,
+              0
+            ],
+            "span": [
+              3,
+              4
+            ],
+            "type": "group"
+          },
+          {
+            "id": "note",
+            "label": "Shown when power",
+            "position": [
+              5,
+              0
+            ],
+            "type": "label",
+            "visible": {
+              "operator": "eq",
+              "value": true,
+              "when": "power"
+            }
+          }
+        ],
+        "grid": {
+          "columns": 4,
+          "rows": 8
+        },
+        "icon": "gauge",
+        "id": "t_main",
+        "title": "Main"
+      },
+      {
+        "children": [],
+        "grid": {
+          "columns": 2,
+          "rows": 4
+        },
+        "icon": "list.bullet",
+        "id": "t_more",
+        "title": "More"
+      }
+    ],
+    "version": 1
+  },
+  "input": {
+    "glance": {
+      "hero": "temp",
+      "slots": [
+        "power"
+      ]
+    },
+    "name": "Ops Base",
+    "placements": {
+      "temp": {
+        "default": {
+          "position": [
+            0,
+            0
+          ],
+          "span": [
+            2,
+            2
+          ]
+        }
+      }
+    },
+    "schemaVersion": 2,
+    "styles": {
+      "power": {
+        "tint": "#aa0000"
+      }
+    },
+    "tabs": [
+      {
+        "children": [
+          {
+            "id": "temp",
+            "label": "Temp",
+            "type": "gauge"
+          },
+          {
+            "id": "power",
+            "label": "Power",
+            "position": [
+              0,
+              2
+            ],
+            "span": [
+              1,
+              2
+            ],
+            "type": "toggle"
+          },
+          {
+            "children": [
+              {
+                "id": "oil",
+                "label": "Oil",
+                "position": [
+                  0,
+                  0
+                ],
+                "type": "label"
+              }
+            ],
+            "grid": {
+              "columns": 2,
+              "rows": 2
+            },
+            "id": "engine",
+            "label": "Engine",
+            "position": [
+              2,
+              0
+            ],
+            "span": [
+              3,
+              4
+            ],
+            "type": "group"
+          },
+          {
+            "id": "note",
+            "label": "Shown when power",
+            "position": [
+              5,
+              0
+            ],
+            "type": "label",
+            "visible": {
+              "operator": "eq",
+              "value": true,
+              "when": "power"
+            }
+          }
+        ],
+        "grid": {
+          "columns": 4,
+          "rows": 8
+        },
+        "icon": "gauge",
+        "id": "t_main",
+        "title": "Main"
+      },
+      {
+        "children": [],
+        "grid": {
+          "columns": 2,
+          "rows": 4
+        },
+        "icon": "list.bullet",
+        "id": "t_more",
+        "title": "More"
+      }
+    ],
+    "version": 1
+  },
+  "kit": false,
+  "name": "sectioned-place-default-alias"
+}
