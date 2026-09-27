@@ -96,177 +96,41 @@ def get_sample_layout(name: str) -> str:
     return path.read_text()
 
 
+#: The docs get_layout_schema stitches together, in order. INTERIM (carter-m7s.6): the
+#: generated JSON Schema supersedes this; until then the reference is the source of
+#: truth itself instead of a hand-kept string that drifted (it once listed 8 keys).
+LAYOUT_SCHEMA_DOCS = ("document-contract", "layout-config", "group-def", "control-def")
+
+
+def _schema_doc(doc_id: str) -> Optional[str]:
+    """A doc from the website definitions, else the installed carterkit's copy (a doc
+    newer than the last site deploy is still found)."""
+    text = content.load_doc(doc_id)
+    if text is None:
+        path = content.demos_dir() / f"{doc_id}.md"
+        if path.exists():
+            text = path.read_text()
+    return text
+
+
 @mcp.tool()
 def get_layout_schema() -> str:
-    """Get the layout JSON structure reference showing all fields and their types."""
-    return """# CAR-TER Layout Schema
-
-## Top Level (LayoutConfig)
-
-```json
-{
-  "name": "string (required) — display name",
-  "headerTitle": "string — header bar title (defaults to name)",
-  "version": 1,
-  "accentColor": "#hex — app accent color (default #667eea)",
-  "connection": { ... } | null,
-  "tabs": [ TabDefinition, ... ],
-  "pollGroups": { "name": { "event": "string", "interval": number, "payload": any } },
-  "dynamicTabs": [ { "event": "string" } ]
-}
-```
-
-## ConnectionConfig
-
-```json
-{
-  "url": "wss://... (required)",
-  "token": "string | null",
-  "identity": {
-    "name": "string — device display name",
-    "channel": "string — mesh channel",
-    "role": "string — mesh role",
-    "canBroadcast": false,
-    "canRoute": false
-  }
-}
-```
-
-## TabDefinition
-
-```json
-{
-  "title": "string (required)",
-  "icon": "string — SF Symbol name (required)",
-  "grid": { "columns": int, "rows": int, "mode": "grid|flow", "rowHeight": int },
-  "children": [ ChildDefinition, ... ]
-}
-```
-
-**Grid modes:** a grid is `columns × rows`. The default `mode: "grid"` is true 2-D —
-each child fills a `row × col` rectangle (`colSpan`=width, `rowSpan × rowHeight`=height,
-default `rowHeight` 56pt), so a tall control can sit beside two stacked shorter ones.
-Use `mode: "flow"` for the legacy row-banded layout (a full-page `map`/`chat`/`cardList`,
-or a plain form). A square control (ring, full gauge) reads best at ~3 `rowSpan`; inputs at 1.
-
-## ChildDefinition
-
-Either a control or a group:
-
-### ControlDefinition
-```json
-{
-  "type": "button|toggle|slider|stepper|segmentedControl|picker|datePicker|textInput|colorPicker|label|image|gauge|sparkline|progressRing|map|graph|chat|cardList",
-  "id": "string (required, unique)",
-  "position": [row, col],
-  "span": [rowSpan, colSpan] (default [1, 1]) — 2-D grid: colSpan=width, rowSpan=height,
-  "controlHeight": number — override grid-derived height (rarely needed),
-  "label": "string",
-  "defaultValue": any,
-  "icon": "string — SF Symbol",
-  "tint": "#hex",
-  "hideLabel": bool,
-  "hideValue": bool — ring/gauge: hide the center number (a compact, scaling visual),
-  "hideBackground": bool — drop the card; the control floats and fills its cell,
-
-  // Type-specific fields:
-  "min": number, "max": number, "step": number,
-  "minIcon": "string", "maxIcon": "string",
-  "options": ["string", ...],
-  "placeholder": "string",
-  "text": "string (for label type)",
-  "systemName": "string (for image type — SF Symbol)",
-
-  // Gauge
-  "gaugeStyle": "full|three_quarter|half",
-  "segments": [{ "limit": number, "color": "#hex" }],
-
-  // ProgressRing
-  "progressStyle": "ring|bar",
-
-  // Sparkline
-  "sparklinePoints": int,
-  "sparklineFill": bool,
-
-  // Picker
-  "pickerStyle": "menu|wheel|inline",
-
-  // DatePicker
-  "datePickerStyle": "compact|wheel|graphical",
-  "datePickerMode": "date|time|dateAndTime",
-
-  // Map
-  "mapStyle": "standard|satellite|hybrid",
-  "mapInteractive": bool,
-
-  // Graph
-  "graphConfig": { ... see graph doc },
-
-  // Chat
-  "config": { "target": string|null, "showTypingIndicators": bool, "historyCount": int },
-
-  // Behavior
-  "action": ActionDefinition,
-  "sync": [ SyncDefinition, ... ],
-  "visible": { "when": "control-id", "operator": "eq|neq|gt|lt|gte|lte", "value": any },
-  "haptic": "light|medium|heavy|success|warning|error|selection",
-  "animation": "snappy|smooth|bouncy|gentle|instant",
-
-  // Long press
-  "longPressGroup": GroupDefinition,
-  "longPressAction": ActionDefinition
-}
-```
-
-### GroupDefinition
-```json
-{
-  "type": "group",
-  "id": "string (required)",
-  "label": "string",
-  "position": [row, col],
-  "span": [rowSpan, colSpan],
-  "grid": { "columns": int, "rows": int, "mode": "grid|flow", "rowHeight": int },
-  "children": [ ChildDefinition, ... ],
-  "dynamic": "string — event name for dynamic content",
-  "visible": { ... }
-}
-```
-
-### ActionDefinition
-```json
-{
-  "method": "meshsocket",
-  "mode": "request|broadcast",
-  "event": "string",
-  "payload": { "key": "{{value}}" }
-}
-```
-
-### SyncDefinition
-```json
-{
-  "method": "meshsocket",
-  "type": "listen",
-  "event": "string — event to listen for",
-  "filter": { "key": "value" },
-  "valuePath": "string — dot-notation path to extract value"
-}
-```
-
-## Grid Positioning
-
-- `position: [row, col]` — zero-indexed
-- `span: [rowSpan, colSpan]` — how many cells the control occupies
-- Grid is defined per-tab and per-group
-- Children must fit within the parent grid dimensions
-
-## SF Symbol Icons
-
-Common icons: slider.horizontal.3, bolt.fill, sun.max, gauge.with.dots.needle.67percent,
-map.fill, bubble.left.and.bubble.right.fill, gearshape.fill, house.fill, chart.line.uptrend.xyaxis,
-antenna.radiowaves.left.and.right, hand.tap.fill, arrow.clockwise, star.fill, heart.fill
-"""
+    """Get the layout JSON structure reference: the document contract (schemaVersion vs
+    version, extensions{}, reserved keys, identity, limits, assets, the sectioned form)
+    plus the layout, group and control field references — straight from ControlDocs."""
+    parts = ["# CAR-TER Layout Schema\n\nFrom ControlDocs, the source of truth. "
+             "Per-control fields: get_control_doc / get_control_catalog."]
+    missing = []
+    for doc_id in LAYOUT_SCHEMA_DOCS:
+        text = _schema_doc(doc_id)
+        if text is None:
+            missing.append(doc_id)
+            continue
+        parts.append(f"<!-- {doc_id}.md -->\n{text.strip()}")
+    if missing:
+        parts.append("(Not in the current definitions: " + ", ".join(missing)
+                     + " — run check_sources; the site or kit may predate them.)")
+    return "\n\n---\n\n".join(parts)
 
 
 @mcp.tool()
