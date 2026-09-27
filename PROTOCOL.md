@@ -164,12 +164,33 @@ Reply:
   "ok": true,
   "appVersion": "1.3.0",            // CFBundleShortVersionString
   "build": "57",                    // CFBundleVersion
-  "protocolVersion": 1,             // layout/wire protocol the app speaks
+  "protocolVersion": 2,             // layout/wire protocol the app speaks
   "catalogFingerprint": "sha256:…", // OPTIONAL — hash of the ControlDocs the app bundles
   "model": "iPhone15,2",            // OPTIONAL
-  "osVersion": "18.5"               // OPTIONAL
+  "osVersion": "18.5",              // OPTIONAL
+  "features": ["action.http", "control.button", "control.gauge", "layout.fallback",
+               "layout.requires", "sync.meshsocket", "…"]  // OPTIONAL (carter-5sn.4)
 }
 ```
+`features` (OPTIONAL; absent on CAR-TER 1.2.4 and earlier) is the exact list of
+things this build speaks, the same list a layout's `requires.features` is checked
+against. Names: `control.<type>` (every authorable control type), `sync.<method>`,
+`action.<method>`, and `layout.<key>` for document-level features (`layout.requires`,
+`layout.fallback`). A name may carry a version, `name@N` (absent = 1); the app meets
+`name@N` when it speaks `name` at N or higher.
+
+When `features` is present the MCP judges drift by it alone: `check_sources` lists
+the catalog's control types (plus any manifest `features`) the phone lacks and
+skips the integer `protocolVersion` compare, and a routed `push_layout` appends a
+**Forward-compat** block naming each control that will draw as an "Update CAR-TER"
+placeholder or as its `fallback`, each `sync`/`action` binding whose method the
+phone ignores, and an unmet `requires` (`app` newer than `appVersion`, or a missing
+`requires.features` entry) that shows the update banner. The push still applies.
+When `features` is absent the MCP treats the feature set as unknown: no
+forward-compat block, and `check_sources` falls back to the protocol compare, which
+flags only an app whose `protocolVersion` is LOWER than the catalog's (the app's
+number also counts routed-verb changes, e.g. v2 = the studio/layout socket split,
+that the catalog never bumps).
 All fields except `ok` are optional and the MCP tolerates their absence — an older
 app that doesn't implement this verb simply times out, which the MCP reports as
 "update the app to enable drift detection." If the app already carries the

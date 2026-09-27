@@ -56,3 +56,10 @@ last_probe_frames: list = []
 # Resolved by the `control-edit-response` listener when the user taps "Send to
 # Editor" on the phone's configurator (the customize_on_phone round-trip).
 control_edit_future: Optional[asyncio.Future] = None
+
+# ─── Device readback cache ────────────────────────────────────────────────────
+
+# Last get-device-info reply per device_id (carter-5sn.6). push_layout reads it to
+# append the forward-compat block without re-asking every push. `{}` records "asked,
+# the app didn't report version info" so an old app isn't re-queried each push.
+device_info_cache: dict[str, dict] = {}

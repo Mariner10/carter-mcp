@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from typing import Optional
 
+from carter_mcp.forward_compat import format_forward_compat, layout_forward_compat  # noqa: F401  (re-export)
+
 
 def format_routed_response(result, on_ok, verb: str) -> str:
     """Render a routed-RPC reply, handling the three failure surfaces uniformly.
@@ -130,7 +132,7 @@ def format_connection_status(resp: dict) -> str:
 # tolerates its absence (older apps just don't reply / omit the fields).
 
 _DEVICE_INFO_KEYS = ("appVersion", "build", "protocolVersion",
-                     "catalogFingerprint", "model", "osVersion")
+                     "catalogFingerprint", "model", "osVersion", "features")
 
 
 def extract_device_info(resp) -> Optional[dict]:
@@ -162,6 +164,9 @@ def format_device_info(resp: dict) -> str:
     out = "Paired device: " + " · ".join(bits)
     if info.get("catalogFingerprint"):
         out += f"\n  catalog fingerprint: {str(info['catalogFingerprint'])[:23]}…"
+    feats = info.get("features")
+    if isinstance(feats, list):
+        out += f"\n  features: {len(feats)} reported (control/sync/action/layout)"
     return out
 
 

@@ -215,8 +215,10 @@ async def apply_or_broadcast(layout: dict) -> str:
             "type": "apply-layout",
             "payload": protocol.build_apply_layout_request(layout),
         }, timeout=5.0)
-        return protocol.format_routed_response(
+        text = protocol.format_routed_response(
             result, on_ok=protocol.format_apply_result, verb="apply-layout")
+        note = await _forward_compat_note(device_id, layout)
+        return f"{text}\n\n{note}" if note else text
 
     payload = dict(layout)
     payload["msg_type"] = "layout-update"
@@ -339,5 +341,19 @@ async def device_info_if_connected() -> Optional[dict]:
             result = None
         info = protocol.extract_device_info(result)
         if info:
+            state.device_info_cache[device_id] = info
             return info
+    state.device_info_cache[device_id] = {}
     return None
+
+
+async def _forward_compat_note(device_id, layout: dict) -> str:
+    """The 'Forward-compat' block for a routed push ('' when clean or unknown).
+    Uses the cached device info; asks once per device if none. Never raises."""
+    try:
+        if device_id not in state.device_info_cache:
+            await device_info_if_connected()
+        info = state.device_info_cache.get(device_id) or {}
+        return protocol.format_forward_compat(protocol.layout_forward_compat(layout, info))
+    except Exception:
+        return ""

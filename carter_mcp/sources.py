@@ -56,6 +56,8 @@ HTTP_TIMEOUT = int(os.environ.get("CARTER_HTTP_TIMEOUT", "12"))
 
 _USER_AGENT = "carter-mcp/sources"
 
+from carter_mcp.forward_compat import missing_catalog_features
+
 # Repo-relative last-resort copy of the docs (only meaningful in the dev workspace).
 from carter_mcp.paths import REPO_CONTROLDOCS as _REPO_CONTROLDOCS
 
@@ -354,12 +356,31 @@ def sources_status(device_info: Optional[dict] = None, refresh: bool = False) ->
                       "differ (fingerprint mismatch) — examples may reference "
                       "fields not in the published catalog, or vice versa.")
     if device_info:
-        dev_proto = device_info.get("protocolVersion")
-        site_proto = manifest.get("protocolVersion")
-        if dev_proto is not None and site_proto is not None and dev_proto != site_proto:
-            issues.append(f"Paired app speaks protocol v{dev_proto} but the catalog "
-                          f"targets v{site_proto} — update the app or expect some "
-                          f"controls to be ignored.")
+        missing = missing_catalog_features(
+            device_info, list(((bundle or {}).get("catalog") or {}).keys()),
+            manifest.get("features") or [])
+        if missing is not None:
+            # A features-reporting app (carter-5sn.4) is judged by exactly what it
+            # speaks; the coarse integer protocol compare is skipped.
+            status["device"] = dict(device_info, missingFeatures=missing)
+            if missing:
+                head = ", ".join(missing[:10])
+                more = f" (+{len(missing) - 10} more)" if len(missing) > 10 else ""
+                issues.append(f"Paired app is missing {len(missing)} catalog "
+                              f"feature(s): {head}{more} — those controls render as "
+                              f"'Update CAR-TER' placeholders (or their fallback) "
+                              f"and those bindings are ignored.")
+        else:
+            dev_proto = device_info.get("protocolVersion")
+            site_proto = manifest.get("protocolVersion")
+            # Only an app OLDER than the catalog's protocol can drop controls. The
+            # app's number also tracks routed-verb changes (v2 = studio/layout socket
+            # split) the catalog never bumps, so a newer app is not drift.
+            if isinstance(dev_proto, int) and isinstance(site_proto, int) \
+                    and dev_proto < site_proto:
+                issues.append(f"Paired app speaks protocol v{dev_proto} but the catalog "
+                              f"targets v{site_proto} — update the app or expect some "
+                              f"controls to be ignored.")
         dev_fp = device_info.get("catalogFingerprint")
         if dev_fp and site_fp and dev_fp != site_fp:
             issues.append("The paired app's control definitions differ from the "
@@ -400,6 +421,13 @@ def format_status(status: dict) -> str:
                      + (f" (build {d['build']})" if d.get("build") else ""))
         if d.get("protocolVersion") is not None:
             lines.append(f"- protocol: v{d['protocolVersion']}")
+        if isinstance(d.get("features"), list):
+            miss = d.get("missingFeatures") or []
+            lines.append(f"- features: {len(d['features'])} reported · "
+                         f"{len(miss)} catalog feature(s) missing")
+            if miss:
+                lines.append(f"- missing: {', '.join(miss[:10])}"
+                             + (f" (+{len(miss) - 10} more)" if len(miss) > 10 else ""))
 
     lines.append("")
     if status["aligned"]:
