@@ -146,7 +146,9 @@ def lint_against_traffic() -> str:
 def lint_dynamic_traffic() -> str:
     """Check the buffer's `dynamic=` groups against the broadcasts seen by the last
     probe: events that never arrive, payloads missing a `children` array, and injected
-    children that won't render (unknown type, bad enum, id clash, off-grid placement).
+    children that won't render (unknown type, bad enum, off-grid placement, or an id
+    clash: within the deck or with one of the layout's own ids, which makes the app
+    refuse the whole deck).
     Run probe_service first. The dynamic-content counterpart to lint_against_traffic."""
     if state.work_buffer is None:
         return "No active buffer. Call begin_edit first."

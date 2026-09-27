@@ -314,8 +314,9 @@ def discard_buffer() -> str:
 
 @mcp.tool()
 def validate_layout(layout_json: str = "", layout_path: str = "") -> str:
-    """Lint a layout against the control schema WITHOUT pushing it: duplicate ids,
-    unknown control types, unknown/bad-enum fields, and grid overlaps/out-of-bounds.
+    """Lint a layout against the control schema WITHOUT pushing it: duplicate ids
+    (grid children, groups, container panel children and long-press popup children
+    share one namespace, as on the device), unknown control types, unknown/bad-enum fields, and grid overlaps/out-of-bounds.
 
     With layout_path this is the compiler-check for on-disk layouts: lint the
     file, then hand the same path to push_layout / save_device_layout — the
