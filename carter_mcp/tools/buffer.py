@@ -15,7 +15,7 @@ from typing import Optional
 from carterkit import catalog, grid, validate
 from carterkit.buffer import BufferError, LayoutBuffer
 
-from carter_mcp import content, mesh, state
+from carter_mcp import content, mesh, sections, state
 from carter_mcp.app import mcp
 from carter_mcp.layoutio import load_layout_arg
 from carter_mcp.paths import SAMPLE_LAYOUTS_DIR
@@ -58,7 +58,7 @@ async def begin_edit(name: str = "Untitled", columns: int = 4, rows: int = 8,
         if err:
             return err
         try:
-            state.work_buffer = LayoutBuffer.from_layout(layout)
+            state.work_buffer = LayoutBuffer.from_layout(sections.for_buffer(layout))
         except BufferError as e:
             return f"'{from_file}' couldn't be loaded into the buffer: {e}"
         return (f"Buffer seeded from {from_file}.\n\n" + state.work_buffer.summary())
@@ -70,7 +70,7 @@ async def begin_edit(name: str = "Untitled", columns: int = 4, rows: int = 8,
             return (f"Couldn't read '{from_device_file}' off the device — "
                     "check list_device_layouts for the exact filename.")
         try:
-            state.work_buffer = LayoutBuffer.from_layout(layout)
+            state.work_buffer = LayoutBuffer.from_layout(sections.for_buffer(layout))
         except BufferError as e:
             return f"Device layout couldn't be loaded into the buffer: {e}"
         return (f"Buffer seeded from the device's saved '{from_device_file}'.\n\n"
@@ -82,7 +82,7 @@ async def begin_edit(name: str = "Untitled", columns: int = 4, rows: int = 8,
         if not layout:
             return "Couldn't read a layout off the device (none loaded, or it didn't respond)."
         try:
-            state.work_buffer = LayoutBuffer.from_layout(layout)
+            state.work_buffer = LayoutBuffer.from_layout(sections.for_buffer(layout))
         except BufferError as e:
             return f"Device layout couldn't be loaded into the buffer: {e}"
         return "Buffer seeded from the live device layout.\n\n" + state.work_buffer.summary()
@@ -93,7 +93,7 @@ async def begin_edit(name: str = "Untitled", columns: int = 4, rows: int = 8,
             avail = ", ".join(f.name for f in SAMPLE_LAYOUTS_DIR.glob("*.json"))
             return f"Sample '{fname}' not found. Available: {avail}"
         try:
-            state.work_buffer = LayoutBuffer.from_layout(json.loads(path.read_text()))
+            state.work_buffer = LayoutBuffer.from_layout(sections.for_buffer(json.loads(path.read_text())))
         except (json.JSONDecodeError, BufferError) as e:
             return f"Couldn't load sample: {e}"
         return f"Buffer seeded from {fname}.\n\n" + state.work_buffer.summary()
@@ -329,7 +329,7 @@ def validate_layout(layout_json: str = "", layout_path: str = "") -> str:
     if err:
         return err
     return validate.format_findings(
-        validate.validate_layout(layout, content.build_catalog(include_theme=True)))
+        validate.validate_layout(sections.lintable(layout), content.build_catalog(include_theme=True)))
 
 
 @mcp.tool()
@@ -374,5 +374,5 @@ def revert_buffer(index: int = -1) -> str:
         label, layout = state.buffer_snapshots[index]
     except IndexError:
         return f"No snapshot at index {index}."
-    state.work_buffer = LayoutBuffer.from_layout(layout)
+    state.work_buffer = LayoutBuffer.from_layout(sections.for_buffer(layout))
     return f"Reverted buffer to '{label}'.\n\n" + state.work_buffer.summary()
