@@ -2,5 +2,7 @@
 # The layout-authoring engine (catalog, buffer, grid, validate, codegen, infer,
 # theming, tune) now comes from carterkit; meshsocket arrives transitively via it.
 carterkit>=0.5.0
-mcp>=1.0
+# mcp 2.x removed mcp.server.fastmcp (renamed mcp.server.mcpserver.MCPServer);
+# app.py targets the 1.x FastMCP API. Bump only alongside a port (carter-do9).
+mcp>=1.0,<2
 qrcode[pil]>=7.4

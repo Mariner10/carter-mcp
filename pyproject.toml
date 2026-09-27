@@ -13,7 +13,7 @@ requires-python = ">=3.11"
 # theming, tune) comes from carterkit; meshsocket arrives transitively via it.
 dependencies = [
     "carterkit>=0.5.0",
-    "mcp>=1.0",
+    "mcp>=1.0,<2",  # 2.x removed mcp.server.fastmcp; app.py uses the 1.x FastMCP API
     "qrcode[pil]>=7.4",
 ]
 
