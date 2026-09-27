@@ -316,6 +316,8 @@ def discard_buffer() -> str:
 def validate_layout(layout_json: str = "", layout_path: str = "") -> str:
     """Lint a layout against the control schema WITHOUT pushing it: duplicate ids,
     unknown control types, unknown/bad-enum fields, and grid overlaps/out-of-bounds.
+    Also warns when a raw colour equals a `theme.palette` token (use `"$name"`; a
+    recolour then edits the palette, not every control) and on unknown `$name` refs.
 
     With layout_path this is the compiler-check for on-disk layouts: lint the
     file, then hand the same path to push_layout / save_device_layout — the
