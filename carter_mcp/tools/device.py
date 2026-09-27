@@ -12,7 +12,7 @@ from typing import Optional
 
 from carterkit.buffer import BufferError
 
-from carter_mcp import content, mesh, protocol, sources, state
+from carter_mcp import content, mesh, protocol, sections, sources, state
 from carter_mcp.app import mcp
 from carter_mcp.layoutio import load_layout_arg
 
@@ -76,7 +76,8 @@ async def push_buffer() -> str:
 
 @mcp.tool()
 async def save_buffer(filename: str = "") -> str:
-    """Push the working buffer AND tell the device to persist it to disk.
+    """Push the working buffer AND tell the device to persist it to disk. A buffer
+    seeded from a sectioned (schemaVersion 2) layout is saved sectioned.
 
     Args:
         filename: Optional filename (derived from the layout name if omitted).
@@ -85,7 +86,8 @@ async def save_buffer(filename: str = "") -> str:
         return "No active buffer. Call begin_edit first."
     if err := mesh.connection_error():
         return err
-    return await mesh.persist_layout_obj(state.work_buffer.layout, filename=filename)
+    # A sectioned source is written back sectioned (carter-m7s.39).
+    return await mesh.persist_layout_obj(sections.saved_form(state.work_buffer), filename=filename)
 
 
 @mcp.tool()

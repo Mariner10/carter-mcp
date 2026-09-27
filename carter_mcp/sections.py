@@ -14,9 +14,12 @@ fallback once the pinned carterkit has ``carterkit.sections``.
 from __future__ import annotations
 
 import copy
+from typing import Optional
+
+from carterkit.buffer import LayoutBuffer
 
 try:                                                  # carterkit >= the m7s.37 release
-    from carterkit.sections import SECTIONS, is_sectioned, to_inline
+    from carterkit.sections import SECTIONS, is_sectioned, to_inline, to_sectioned
     KIT_KNOWS_SECTIONS = True
 except ImportError:                                   # pragma: no cover - depends on the kit
     KIT_KNOWS_SECTIONS = False
@@ -77,6 +80,41 @@ except ImportError:                                   # pragma: no cover - depen
             del doc["schemaVersion"]
         return doc
 
+    def to_sectioned(layout: dict) -> dict:
+        """Inverse of ``to_inline``: move each first holder's inline facets into its
+        section entry (an existing entry wins) and declare ``schemaVersion: 2``."""
+        doc = copy.deepcopy(layout)
+        found = {name: {cid: dict(e) for cid, e in doc[name].items() if isinstance(e, dict)}
+                 for name in SECTIONS if isinstance(doc.get(name), dict)}
+        seen: set = set()
+
+        def walk(kids, depth=0):
+            for ch in kids or []:
+                if not isinstance(ch, dict):
+                    continue
+                cid = ch.get("id")
+                if isinstance(cid, str) and cid and cid not in seen:
+                    seen.add(cid)
+                    for name, facets in SECTIONS.items():
+                        for facet in facets:
+                            if facet in ch:
+                                found.setdefault(name, {}).setdefault(cid, {}).setdefault(facet, ch.pop(facet))
+                if depth < 64 and ch.get("type") == "group":
+                    walk(ch.get("children"), depth + 1)
+
+        for tab in doc.get("tabs") or []:
+            if isinstance(tab, dict):
+                walk(tab.get("children"))
+        for name, entries in found.items():
+            kept = {cid: e for cid, e in entries.items() if e}
+            if kept:
+                doc[name] = kept
+            else:
+                doc.pop(name, None)
+        if is_sectioned(doc):
+            doc["schemaVersion"] = 2
+        return doc
+
 
 def lintable(layout: dict) -> dict:
     """What to hand carterkit's validator: the document itself when the kit folds
@@ -91,3 +129,16 @@ def for_buffer(layout: dict) -> dict:
     """The working buffer edits inline keys, so a sectioned seed is folded first
     (a buffer push then sends the inline form, which every app reads)."""
     return to_inline(layout) if is_sectioned(layout) else layout
+
+
+def seed_buffer(layout: dict, sectioned: Optional[bool] = None) -> LayoutBuffer:
+    """A working buffer on the folded view of ``layout`` that remembers whether the
+    source was sectioned (carter-m7s.39), so ``saved_form`` writes it back that way."""
+    buf = LayoutBuffer.from_layout(for_buffer(layout))
+    buf.source_sectioned = is_sectioned(layout) if sectioned is None else sectioned
+    return buf
+
+
+def saved_form(buf: LayoutBuffer) -> dict:
+    """What save writes: the buffer in its source's form (sectioned stays sectioned)."""
+    return to_sectioned(buf.layout) if getattr(buf, "source_sectioned", False) else buf.layout
