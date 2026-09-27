@@ -293,6 +293,45 @@ relay and lands in the file, mirroring the `layout_path` philosophy in reverse.
 Debug-only harness: `AUTO_APPROVE_PROVISION=1` auto-approves the sheet (sims can't tap);
 `AUTO_MINT_STUB=1` answers the mint HTTP call locally. Both `#if DEBUG`, never shipped.
 
+### `local.describe` / `local.query` / `local.upsert` / `local.delete`  (local store, consent-gated)
+Describe, read and write the records in the phone's on-device store (a layout's
+`sources.<name>: { type: "local", … }`). **Studio-socket only** — never served to a
+layout-socket peer. Full contract: `docs/superpowers/specs/2026-09-24-local-readback-design.md` §2.
+
+Addressing: every record verb names a `collection` (as declared, or a view for queries)
+and an optional `namespace` (defaults to the active layout's; shared collections live in
+`"shared"`). Only namespaces the active layout declares are reachable.
+
+| Verb | Consent | Request payload | Reply |
+|---|---|---|---|
+| `local.describe` | none | `{}` | `{ok, layout, layoutId, consent: "granted"\|"pending"\|"none", namespaces: [{namespace, source, shared, collections: [{name, count, mirror, fields, lastWrite}], views}]}` — metadata only, no record content |
+| `local.query` | read | `{collection, namespace?, stage, cursor}` — `stage` passes through to the store; the device clamps `limit` to 200 rows and truncates a page at 256 KB | rows: `{ok, collection, rows: [{id, createdAt, updatedAt, fields}], count, total, cursor, truncated?}`; scalar aggregate: `{ok, collection, value}`; grouped: `{ok, collection, categories, series, rows: [{key, value}]}` |
+| `local.upsert` | write | `{collection, namespace?, mode: "insert"\|"upsert"\|"patch", records: [{id?, fields}]}` — ≤100 records, one transaction | `{ok, collection, inserted, updated, ids, total}` (ids in input order) |
+| `local.delete` | write | `{collection, namespace?, ids}` or `{…, where, confirmTotal}` (`confirmTotal` = the live count) — ≤1000 rows | `{ok, deleted, total}` |
+
+**Consent (two-phase, like provision):** the first `local.query` (read) or
+`local.upsert`/`local.delete` (write) of a studio session raises a sheet on the phone and
+answers at once `{ "error": "consent-pending", "request_id": … }`. The editor polls
+`local.describe` every 1 s until `consent` leaves `pending` (the sheet times out at 60 s),
+then re-sends the original verb once. A read grant does not cover writes (a write re-arms
+the sheet to widen). The grant lasts for the studio session.
+
+Errors are `{ "error": <code>, "reason": "…" }` with codes `bad-request`, `no-layout`,
+`no-local-source`, `unknown-namespace`, `unknown-collection`, `consent-pending`, `denied`
+(`reason`: `user-denied`/`dismissed`/`timeout`), `busy` (another approval sheet is up),
+`invalid-stage`, `limit`, `schema`, `remote-source` (reserved), `validation`, `store-error`.
+An app that predates the verbs never answers — the MCP reports that as drift (run
+`check_sources`).
+
+MCP surface (`carter_mcp/tools/local.py`): `local_describe`, `local_query` (compact
+`id | fields…` table, ≤`max_rows`, cap 200), `local_upsert` (inline for a handful or
+`records_path`), `local_seed` (file-only, pages 100 records per `local.upsert`;
+`replace=True` clears first with `where: {}` + `confirmTotal`, internal only) and
+`local_delete` (**ids only** — stage-based deletes and `mode: "patch"` stay in carterkit).
+Record output is fenced as device data; seed files never transit the model.
+
+Debug-only harness: `AUTO_APPROVE_LOCAL=1` auto-approves the consent sheet (`#if DEBUG`).
+
 ## Broadcast verbs (unchanged, MCP → all viewers)
 
 Kept as-is for the multi-viewer / demo path. Used by `push_layout` only when **no** single device
@@ -360,6 +399,7 @@ a **flat** `event` discriminator alongside its fields:
 | `tab` | `tab` (string — tab id), `title` (string), `index` (int) | the user switches tabs |
 | `action` | `control` (string — control id), `controlType` (string), `payload` (object — the substituted action payload as sent) | any control action fires |
 | `value` | `control` (string), `value` (scalar/JSON) | the user edits a control's value |
+| `local` | `namespace` (string), `collection` (string), `op` (`"upsert"` \| `"delete"`), `ids` (array of record ids), `total` (int — new collection count), `seq` (int — per-session, monotonic) | a write commits to a local-store collection declared `mirror: true` (UI, `local.upsert`, or timers); coalesced per collection to 250 ms; **never carries `fields`** — fetch rows with `local.query` under consent |
 | `bye` | — | the session ends (`stopLiveEditSession`) |
 
 No timestamps ride the wire — a consumer stamps arrival itself (the explorer's SSE layer

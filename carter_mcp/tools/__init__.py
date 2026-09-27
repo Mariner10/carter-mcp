@@ -6,6 +6,7 @@ from carter_mcp.tools import (  # noqa: F401 — imported for their @mcp.tool() 
     device,
     docs,
     generators,
+    local,
     session,
     wiring,
 )
