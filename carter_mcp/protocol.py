@@ -380,3 +380,328 @@ def format_provision_summary(credential: dict, out_path: str, key_verdict: str,
     if warning:
         lines.append(warning)
     return "\n".join(lines)
+
+
+# ─── Studio verbs: render-snapshot / patch-layout / trace-control (K9, DRAFT) ──
+#
+# Routed, studio-socket-only verbs (PROTOCOL.md "render-snapshot" et seq.). The
+# app side is not implemented yet; these are the pure builders/formatters the
+# K10/K12/K15 tools wrap. Replies reuse the `{ok:false, error, reason}` envelope.
+#
+# Capability gate (decision carter-ek9, 2026-09-28): a device advertises a verb
+# as `verb.<name>` in get-device-info `features`; deviceProtocolVersion stays 2.
+# `protocolVersion >= 3` is also honoured so a future bump needs no MCP change.
+
+STUDIO_V3_VERBS = ("render-snapshot", "patch-layout", "trace-control")
+
+_TOO_OLD_WHAT = {
+    "render-snapshot": "snapshots",
+    "patch-layout": "patch pushes",
+    "trace-control": "control tracing",
+}
+
+
+def _verb_name(verb: str) -> str:
+    return verb[len("verb."):] if verb.startswith("verb.") else verb
+
+
+def device_supports(info, verb: str) -> Optional[bool]:
+    """Does the paired device answer `verb`?
+
+    True  — `verb.<name>` (optionally `@N`) is in `info["features"]`, or
+            `protocolVersion >= 3`.
+    False — device info is known and neither applies (an older app: it would
+            silently not answer, so the caller should say "update" instead of
+            waiting out the relay timeout).
+    None  — no device info (not paired / get-device-info unanswered).
+    """
+    if not isinstance(info, dict) or not info:
+        return None
+    name = _verb_name(verb)
+    feats = info.get("features")
+    if isinstance(feats, list):
+        for f in feats:
+            if isinstance(f, str) and f.strip().split("@", 1)[0] == f"verb.{name}":
+                return True
+    proto = info.get("protocolVersion")
+    try:
+        if proto is not None and int(proto) >= 3:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def unsupported_verbs(info, verbs=STUDIO_V3_VERBS) -> list[str]:
+    """The verbs `device_supports` says False for (unknown info → [])."""
+    return [v for v in verbs if device_supports(info, v) is False]
+
+
+def too_old_message(verb: str) -> str:
+    """The line a tool returns instead of timing out on an older app."""
+    what = _TOO_OLD_WHAT.get(_verb_name(verb), f"'{_verb_name(verb)}'")
+    return f"update CAR-TER to 1.3 for {what}"
+
+
+_STUDIO_ERRORS = {
+    "not-foreground": "The phone is locked or CAR-TER is in the background — wake the phone and open CAR-TER, then retry.",
+    "too-large": "The reply would exceed the relay frame budget even after lowering quality/scale — lower `scale`/`quality` or snapshot a smaller tab.",
+    "studio-not-sealed": "The loaded layout is E2EE but the studio session is not sealed (no e2ee key in the pairing) — the device refuses to send its contents in plaintext. Re-pair with an E2EE studio session.",
+    "stale-base": "The device's layout changed since the patch base — fall back to a full apply-layout.",
+    "rate-limited": "The device is rate-limiting this verb — wait a moment and retry.",
+    "unknown-tab": "The device has no tab with that title.",
+    "unknown-control": "The device has no control with that id.",
+    "no-layout": "No layout is loaded on the device.",
+    "bad-request": "The device rejected the request shape.",
+}
+
+
+def studio_error_message(resp, verb: str = "") -> Optional[str]:
+    """A human line for a `{ok:false, error, reason}` studio-verb reply, or None
+    when the reply isn't an error (same style as `provision_error_message`)."""
+    if not isinstance(resp, dict) or resp.get("ok") is True or "error" not in resp:
+        return None
+    error = resp.get("error")
+    reason = resp.get("reason", "")
+    explain = _STUDIO_ERRORS.get(error)
+    if explain is None:
+        where = f" to '{verb}'" if verb else ""
+        explain = f"Device returned error '{error}'{where}."
+    return explain + (f" ({reason})" if reason and reason != error else "")
+
+
+def _num(v) -> str:
+    """56.0 → "56", 0.75 → "0.75"."""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+# ─── render-snapshot ──────────────────────────────────────────────────────────
+
+SNAPSHOT_MODES = ("window", "full")
+
+
+def build_render_snapshot_request(tab: Optional[str] = None, mode: str = "window",
+                                  scale: float = 1, quality: float = 0.7,
+                                  report: bool = True) -> dict:
+    """`render-snapshot` payload. `mode: "full"` is phase 3 on the device."""
+    if mode not in SNAPSHOT_MODES:
+        raise ValueError(f"mode must be one of {SNAPSHOT_MODES}, got {mode!r}")
+    if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not 0 < scale <= 3:
+        raise ValueError(f"scale must be in (0, 3], got {scale!r}")
+    if not isinstance(quality, (int, float)) or isinstance(quality, bool) or not 0 < quality <= 1:
+        raise ValueError(f"quality must be in (0, 1], got {quality!r}")
+    payload = {"mode": mode, "scale": scale, "format": "jpeg",
+               "quality": quality, "report": bool(report)}
+    if tab:
+        payload["tab"] = tab
+    return payload
+
+
+def extract_snapshot_image(resp) -> Optional[bytes]:
+    """Decoded JPEG bytes from an ok reply, or None."""
+    import base64
+    import binascii
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return None
+    data = resp.get("image")
+    if not isinstance(data, str) or not data:
+        return None
+    try:
+        return base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def format_fit_line(cid: str, fit: dict) -> str:
+    """`battery-ring: cell 56pt, content 91pt, scaled 0.75, CUT`."""
+    parts = []
+    if "cell" in fit:
+        parts.append(f"cell {_num(fit['cell'])}pt")
+    if "content" in fit:
+        parts.append(f"content {_num(fit['content'])}pt")
+    scale = fit.get("scale")
+    if scale is not None and scale != 1:
+        parts.append(f"scaled {_num(scale)}")
+    if fit.get("cuts"):
+        parts.append("CUT")
+    return f"{cid}: " + (", ".join(parts) if parts else "no fit data")
+
+
+def format_snapshot_report(resp) -> str:
+    """Text digest of a render-snapshot reply: capture header, per-control fit
+    lines (cut controls first), and the offscreen/unverified/locked lists."""
+    if (err := studio_error_message(resp, "render-snapshot")):
+        return err
+    if not isinstance(resp, dict):
+        return f"Unexpected render-snapshot reply: {resp!r}"
+    head = f"Snapshot of **{resp.get('layoutName', '?')}**"
+    if resp.get("tab"):
+        head += f" · tab {resp['tab']}"
+    px = resp.get("px")
+    if isinstance(px, list) and len(px) == 2:
+        head += f" · {_num(px[0])}×{_num(px[1])}px"
+    if resp.get("scale") is not None:
+        head += f" @{_num(resp['scale'])}x"
+    win = resp.get("window") or {}
+    if win:
+        bits = [b for b in (win.get("idiom"), win.get("sizeClass")) if b]
+        if "w" in win and "h" in win:
+            bits.insert(0, f"{_num(win['w'])}×{_num(win['h'])}pt")
+        if bits:
+            head += f" · window {' '.join(bits)}"
+    lines = [head]
+    if resp.get("sheetPresented"):
+        lines.append("Note: a sheet/alert was presented; it is not in the capture.")
+    controls = resp.get("controls") or {}
+    if controls:
+        cut = sorted(c for c, f in controls.items() if isinstance(f, dict) and f.get("cuts"))
+        ok = sorted(c for c, f in controls.items() if isinstance(f, dict) and not f.get("cuts"))
+        lines.append(f"Fit ({len(cut)} cut of {len(cut) + len(ok)}):")
+        for cid in cut + ok:
+            lines.append("  " + format_fit_line(cid, controls[cid]))
+    elif resp.get("ok"):
+        lines.append("No fit report (report=false or no visible controls).")
+    for key, label in (("offscreen", "Offscreen (below the fold)"),
+                       ("unverified", "Unverified (map/camera/web pixels may be blank)"),
+                       ("locked", "Locked (Pro placeholder, not a bug)")):
+        ids = resp.get(key) or []
+        if ids:
+            lines.append(f"{label}: {', '.join(ids)}")
+    return "\n".join(lines)
+
+
+# ─── patch-layout ─────────────────────────────────────────────────────────────
+
+PATCH_OP_KINDS = ("update", "add", "remove", "move", "layout", "renameTab")
+
+
+def _validate_patch_op(i: int, op) -> None:
+    if not isinstance(op, dict):
+        raise ValueError(f"ops[{i}] must be an object")
+    kind = op.get("op")
+    if kind not in PATCH_OP_KINDS:
+        raise ValueError(f"ops[{i}]: unknown op kind {kind!r} "
+                         f"(expected one of {', '.join(PATCH_OP_KINDS)})")
+    if kind in ("update", "remove", "move") and not (isinstance(op.get("id"), str) and op["id"]):
+        raise ValueError(f"ops[{i}] ({kind}) needs a control `id`")
+    if kind in ("update", "layout"):
+        if not isinstance(op.get("set", {}), dict) or not isinstance(op.get("unset", []), list):
+            raise ValueError(f"ops[{i}] ({kind}): `set` must be an object, `unset` a list")
+        if not op.get("set") and not op.get("unset"):
+            raise ValueError(f"ops[{i}] ({kind}) needs `set` and/or `unset`")
+    if kind == "add":
+        ctl = op.get("control")
+        if not isinstance(ctl, dict) or not ctl.get("id"):
+            raise ValueError(f"ops[{i}] (add) needs a `control` object with an `id`")
+        if not (isinstance(op.get("tab"), str) and op["tab"]):
+            raise ValueError(f"ops[{i}] (add) needs a target `tab` title")
+    if kind == "move" and not any(k in op for k in ("position", "span", "tab")):
+        raise ValueError(f"ops[{i}] (move) needs `position`, `span` and/or `tab`")
+    if kind == "renameTab":
+        if not all(isinstance(op.get(k), str) and op[k] for k in ("from", "to")):
+            raise ValueError(f"ops[{i}] (renameTab) needs `from` and `to` tab titles")
+
+
+def build_patch_layout_request(base: str, ops: list) -> dict:
+    """`patch-layout` payload: id-addressed ops against the layout hashed `base`.
+    Raises ValueError on an unknown op kind or a malformed op."""
+    if not isinstance(base, str) or not base:
+        raise ValueError("base must be the last-acknowledged layout hash (e.g. 'sha256:…')")
+    if not isinstance(ops, list) or not ops:
+        raise ValueError("ops must be a non-empty list")
+    for i, op in enumerate(ops):
+        _validate_patch_op(i, op)
+    return {"base": base, "ops": ops}
+
+
+def is_stale_base(resp) -> bool:
+    """True when the device refused the patch because its layout moved on — the
+    caller should fall back to a full apply-layout."""
+    return isinstance(resp, dict) and not resp.get("ok") and resp.get("error") == "stale-base"
+
+
+def format_patch_result(resp) -> str:
+    if is_stale_base(resp):
+        dev = resp.get("hash")
+        return ("Patch refused: stale-base — the device's layout changed since the "
+                "patch base" + (f" (device is at {dev})" if dev else "")
+                + ". Fall back to a full apply-layout (push_layout).")
+    if (err := studio_error_message(resp, "patch-layout")):
+        return f"Patch failed: {err}"
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return f"Unexpected patch-layout reply: {resp!r}"
+    reload = resp.get("reload")
+    how = {"hot": "hot reload (live values, socket and history kept)",
+           "full": "full reload (wiring changed; values reset)"}.get(reload, f"reload {reload or '?'}")
+    lines = [f"Patched: {resp.get('applied', '?')} op(s) applied · {how}"]
+    if resp.get("hash"):
+        lines.append(f"New base: {resp['hash']}")
+    rendered = resp.get("rendered")
+    if isinstance(rendered, dict) and rendered.get("tabs") is not None:
+        lines.append(format_summary(rendered))
+    return "\n".join(lines)
+
+
+# ─── trace-control ────────────────────────────────────────────────────────────
+
+def build_trace_control_request(ids, frames: int = 20) -> dict:
+    """`trace-control` payload. `ids` may be one id or a list."""
+    if isinstance(ids, str):
+        ids = [ids]
+    if not isinstance(ids, list) or not ids or not all(isinstance(i, str) and i for i in ids):
+        raise ValueError("ids must be a control id or a non-empty list of ids")
+    if isinstance(frames, bool) or not isinstance(frames, int) or frames < 0:
+        raise ValueError(f"frames must be a non-negative int, got {frames!r}")
+    return {"ids": ids, "frames": frames}
+
+
+_TRACE_COUNTERS = ("delivered", "filterMiss", "nearMiss", "pathMiss", "typeMiss")
+
+
+def format_trace(resp) -> str:
+    """Per-control digest: registrations + miss counters, findings, recent frame
+    verdicts, and action outcomes."""
+    if (err := studio_error_message(resp, "trace-control")):
+        return err
+    if not isinstance(resp, dict):
+        return f"Unexpected trace-control reply: {resp!r}"
+    window = resp.get("window_s")
+    lines = ["Control trace" + (f" (last {_num(window)}s)" if window is not None else "")]
+    controls = resp.get("controls") or []
+    if not controls:
+        lines.append("No controls traced.")
+    for c in controls:
+        lines.append(f"- {c.get('id', '?')}")
+        regs = c.get("registrations") or []
+        if not regs:
+            lines.append("    no sync registrations")
+        for r in regs:
+            desc = r.get("event", "?")
+            if r.get("filter"):
+                desc += f" filter {json.dumps(r['filter'], separators=(',', ':'))}"
+            if r.get("valuePath"):
+                desc += f" path {r['valuePath']}"
+            counts = ", ".join(f"{k} {r[k]}" for k in _TRACE_COUNTERS if k in r)
+            lines.append(f"    reg {desc}" + (f": {counts}" if counts else ""))
+        for f in c.get("findings") or []:
+            text = f if isinstance(f, str) else (f.get("message") or f.get("code") or json.dumps(f))
+            lines.append(f"    finding: {text}")
+        frames = c.get("frames") or []
+        if frames:
+            verdicts: dict[str, int] = {}
+            for fr in frames:
+                v = fr.get("verdict", "?") if isinstance(fr, dict) else "?"
+                verdicts[v] = verdicts.get(v, 0) + 1
+            lines.append(f"    frames ({len(frames)}): "
+                         + ", ".join(f"{v} ×{n}" for v, n in sorted(verdicts.items())))
+        for a in c.get("actions") or []:
+            bit = f"    action {a.get('event', '?')}"
+            if a.get("cmd"):
+                bit += f" {a['cmd']}"
+            bit += f" → {a.get('outcome', '?')}"
+            if a.get("rtt_ms") is not None:
+                bit += f" ({_num(a['rtt_ms'])} ms)"
+            lines.append(bit)
+    return "\n".join(lines)

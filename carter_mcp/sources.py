@@ -56,6 +56,8 @@ HTTP_TIMEOUT = int(os.environ.get("CARTER_HTTP_TIMEOUT", "12"))
 
 _USER_AGENT = "carter-mcp/sources"
 
+from carter_mcp import protocol
+
 # Repo-relative last-resort copy of the docs (only meaningful in the dev workspace).
 from carter_mcp.paths import REPO_CONTROLDOCS as _REPO_CONTROLDOCS
 
@@ -357,9 +359,18 @@ def sources_status(device_info: Optional[dict] = None, refresh: bool = False) ->
         dev_proto = device_info.get("protocolVersion")
         site_proto = manifest.get("protocolVersion")
         if dev_proto is not None and site_proto is not None and dev_proto != site_proto:
-            issues.append(f"Paired app speaks protocol v{dev_proto} but the catalog "
-                          f"targets v{site_proto} — update the app or expect some "
-                          f"controls to be ignored.")
+            try:
+                newer = int(dev_proto) > int(site_proto)
+            except (TypeError, ValueError):
+                newer = False
+            if newer:
+                issues.append(f"Paired app speaks protocol v{dev_proto}, newer than the "
+                              f"catalog's v{site_proto} — the published catalog is behind "
+                              f"the app (not an app problem).")
+            else:
+                issues.append(f"Paired app speaks protocol v{dev_proto} but the catalog "
+                              f"targets v{site_proto} — update the app or expect some "
+                              f"controls to be ignored.")
         dev_fp = device_info.get("catalogFingerprint")
         if dev_fp and site_fp and dev_fp != site_fp:
             issues.append("The paired app's control definitions differ from the "
@@ -368,6 +379,9 @@ def sources_status(device_info: Optional[dict] = None, refresh: bool = False) ->
 
     status["issues"] = issues
     status["aligned"] = not issues
+    # Newer studio verbs the paired app won't answer. Informational, not drift:
+    # every pre-1.3 app lacks them and still renders the catalog correctly.
+    status["missingVerbs"] = protocol.unsupported_verbs(device_info)
     return status
 
 
@@ -400,6 +414,9 @@ def format_status(status: dict) -> str:
                      + (f" (build {d['build']})" if d.get("build") else ""))
         if d.get("protocolVersion") is not None:
             lines.append(f"- protocol: v{d['protocolVersion']}")
+        if status.get("missingVerbs"):
+            lines.append(f"- studio verbs not supported: {', '.join(status['missingVerbs'])}"
+                         " (update CAR-TER to 1.3 for them)")
 
     lines.append("")
     if status["aligned"]:

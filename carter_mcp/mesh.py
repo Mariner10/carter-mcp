@@ -186,10 +186,14 @@ def no_device_error() -> str:
 
 # ─── Routed RPC + push paths ──────────────────────────────────────────────────
 
-async def routed_request(verb: str, payload, on_ok) -> str:
+async def routed_request(verb: str, payload, on_ok, timeout: float = 5.0) -> str:
     """Resolve the paired device, send a routed `verb` request, and format the
     reply via `protocol.format_routed_response` (handles not-connected / no-device /
     timeout / relay-error uniformly). `on_ok(result)` renders a successful reply.
+
+    `timeout` is passed straight to the socket request. The relay caps a routed
+    reply at about 5 s, so callers should never ask for more than 5.0; slow
+    verbs use the arm-and-poll pattern (provision-device) instead.
     """
     if err := connection_error():
         return err
@@ -200,7 +204,7 @@ async def routed_request(verb: str, payload, on_ok) -> str:
         "target_id": device_id,
         "type": verb,
         "payload": payload,
-    }, timeout=5.0)
+    }, timeout=timeout)
     return protocol.format_routed_response(result, on_ok=on_ok, verb=verb)
 
 

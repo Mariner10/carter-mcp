@@ -238,6 +238,90 @@ it the editor's live-data eyes without room credentials or keys ever leaving the
 The MCP tool `watch_traffic(seconds, filter)` enables the tap, collects for a window,
 disables it, and returns a per-control digest (last value + rate).
 
+### Studio verbs gate: `verb.<name>` features  (DRAFT)
+The three verbs below are **DRAFT — pending app implementation** (CAR-TER 1.3). A
+device advertises each one it answers as `verb.<name>` (optionally `@N`) in the
+`get-device-info` `features` list; `deviceProtocolVersion` stays 2 (decision
+carter-ek9). The MCP also accepts `protocolVersion >= 3` as "supports all three".
+When the device info is known and neither applies, the MCP answers at once with
+"update CAR-TER to 1.3 for snapshots" (etc.) instead of waiting out the 5 s relay
+timeout. All three are **studio-socket only** (never in `layoutSocketVerbs`) and
+reply errors as `{ "ok": false, "error": "<code>", "reason": "…" }`. Shared codes:
+`not-foreground` (phone locked / app backgrounded, answered immediately),
+`studio-not-sealed` (E2EE layout on an unsealed gateway studio socket),
+`rate-limited`, `no-layout`, `bad-request`.
+
+### `render-snapshot`  (studio-only, DRAFT — pending app implementation)
+Capture what the phone actually drew (window capture via `drawHierarchy`) plus a
+per-control fit report.
+
+Request payload:
+```json
+{ "mode": "window", "scale": 1, "format": "jpeg", "quality": 0.7,
+  "tab": "Power", "report": true }        // tab optional; mode "full" is phase 3
+```
+Reply:
+```json
+{ "ok": true, "image": "<base64 jpeg>", "px": [402, 874], "scale": 1,
+  "window": { "w": 402, "h": 874, "sizeClass": "compact", "idiom": "phone" },
+  "tab": "Power", "layoutName": "Nordlys Station", "sheetPresented": false,
+  "controls": {
+    "battery-ring": { "frame": [16,212,178,56], "cell": 56, "content": 91,
+                      "scale": 0.75, "cuts": true } },
+  "offscreen": ["log-tail"], "unverified": ["route-map"], "locked": [] }
+```
+- `unverified` — map/camera/web-view controls whose pixels may be blank in the capture.
+- `locked` — controls showing the Pro upsell placeholder.
+- Extra error: `too-large` — the frame cannot fit the ~200 KB budget even after the
+  device lowers quality/scale.
+
+### `patch-layout`  (studio-only, DRAFT — pending app implementation)
+Apply id-addressed edits to the running layout. Cosmetic-only patches hot-reload
+(live values, socket, sparkline history kept).
+
+Request payload:
+```json
+{ "base": "sha256:9f1c…",
+  "ops": [
+    { "op": "update", "id": "battery-ring", "set": { "span": [2,2] }, "unset": ["style"] },
+    { "op": "add", "tab": "Power", "control": { "id": "soc-label", "type": "label" } },
+    { "op": "remove", "id": "old-spark" },
+    { "op": "move", "id": "pv-gauge", "position": [2,0], "span": [2,2], "tab": "Solar" },
+    { "op": "layout", "set": { "accentColor": "#7CFFB2" } },
+    { "op": "renameTab", "from": "Power", "to": "Energy" } ] }
+```
+Op kinds: `update`, `add`, `remove`, `move`, `layout`, `renameTab` — the MCP rejects
+anything else before sending. Reply:
+```json
+{ "ok": true, "hash": "sha256:41ab…", "applied": 6, "reload": "hot",
+  "rendered": { "…same summary shape as apply-layout…" } }
+```
+- `reload` is `hot` or `full` (`full` when `connection`, any `sync`/`action`,
+  `sources`, `sensors`, `pollGroups`, `dynamicTabs`, `keepAwake` or `alerts` changed).
+- Stale base: `{ "ok": false, "error": "stale-base", "hash": "sha256:…" }` — the MCP
+  falls back to a full `apply-layout`. Retrying an applied patch yields `stale-base`,
+  never a double apply.
+
+### `trace-control`  (studio-only, DRAFT — pending app implementation)
+Pull (not stream) why a control is or isn't getting data. Sits beside
+`watch-traffic`; frame values reuse its 1 KB truncation.
+
+Request payload:
+```json
+{ "ids": ["temp"], "frames": 20 }
+```
+Reply:
+```json
+{ "ok": true, "window_s": 60, "controls": [ { "id": "temp",
+  "registrations": [ { "event": "broadcast", "filter": {"msg_type": "telemetery"},
+      "valuePath": "t.c", "delivered": 0, "filterMiss": 12, "nearMiss": 12,
+      "pathMiss": 0, "typeMiss": 0 } ],
+  "findings": ["…"],
+  "frames": [ { "at": 0, "verdict": "filter_miss", "value": {"truncated": true} } ],
+  "actions": [ { "at": 0, "event": "broadcast_request", "cmd": "…",
+      "outcome": "ack", "rtt_ms": 84 } ] } ] }
+```
+
 ### `provision-device` + `get-provision-result`  (hub credential mint, human-gated)
 Mint a Hub credential for a channel through the phone — the studio-session version of
 **Add Device**. **Studio-socket only**, and every mint is gated by an approval sheet on
