@@ -52,6 +52,9 @@ last_probe_events: dict = {}
 # Raw decoded payloads from the last probe_service run, consumed by
 # lint_dynamic_traffic (which needs the actual `children` arrays, not the aggregate).
 last_probe_frames: list = []
+# The event the last probe listened on; only syncs on that event are judged
+# against last_probe_frames.
+last_probe_event: str = "broadcast"
 
 # Resolved by the `control-edit-response` listener when the user taps "Send to
 # Editor" on the phone's configurator (the customize_on_phone round-trip).
