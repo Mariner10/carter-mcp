@@ -9,7 +9,7 @@ import json
 from carterkit import dynamic, validate
 from carterkit.buffer import LayoutBuffer
 
-from carter_mcp import autowire, chat, mesh, meshgraph, probe, qa, state
+from carter_mcp import autowire, chat, mesh, meshgraph, probe, qa, state, wirecheck
 from carter_mcp import simulate as simulate_lib  # the `simulate` tool below shadows the name
 from carter_mcp.app import mcp
 
@@ -42,6 +42,7 @@ async def probe_service(seconds: int = 8, event: str = "broadcast") -> str:
             state.socket.handlers.pop(event, None)
     state.last_probe_events = probe.aggregate(frames)
     state.last_probe_frames = [payload for _ev, payload in frames]
+    state.last_probe_event = event
     return (f"Observed {len(frames)} frame(s) on '{event}' over {seconds}s.\n\n"
             + probe.format_discovery(state.last_probe_events))
 
@@ -50,6 +51,8 @@ async def probe_service(seconds: int = 8, event: str = "broadcast") -> str:
 async def simulate(payload_json: str, event: str = "broadcast") -> str:
     """Emit a data frame onto the channel as if from the service — drives any synced
     controls so gauges move and sparklines fill (live demo / no-backend testing).
+    With a working buffer open, also reports what the frame does to each bound
+    control (DELIVERED / FILTER_MISS / PATH_MISSING / TYPE_UNRENDERABLE).
 
     Args:
         payload_json: The frame to emit, e.g. {"battery":82,"cpu_temp":61}.
@@ -65,7 +68,12 @@ async def simulate(payload_json: str, event: str = "broadcast") -> str:
         await state.socket.send("broadcast_request" if event == "broadcast" else event, payload)
     except Exception as e:
         return f"Failed to emit: {e}"
-    return f"Emitted on '{event}': {json.dumps(payload)[:200]}"
+    out = f"Emitted on '{event}': {json.dumps(payload)[:200]}"
+    layout = state.work_buffer.layout if state.work_buffer is not None else None
+    report = wirecheck.simulate_report(layout, payload, event)
+    if report:
+        out += "\nPer control (app matching rules):\n" + "\n".join(report)
+    return out
 
 
 @mcp.tool()
@@ -86,12 +94,13 @@ async def set_control_value(control_id: str, value_json: str) -> str:
     binding = simulate_lib.control_binding(found[2])
     if not binding:
         return f"'{control_id}' has no listen sync to drive. Wire it first (autowire_buffer)."
-    event, path = binding
+    _event, path = binding
     try:
         value = json.loads(value_json)
     except json.JSONDecodeError:
         value = value_json  # treat as a bare string
-    frame = simulate_lib.build_frame({path: value})
+    # The sync's filter keys ride along, or a filtered control would never match.
+    event, frame = wirecheck.frame_for_control(found[2], value)
     try:
         await state.socket.send("broadcast_request" if event == "broadcast" else event, frame)
     except Exception as e:
@@ -128,18 +137,19 @@ def autowire_buffer(event: str = "broadcast") -> str:
 
 @mcp.tool()
 def lint_against_traffic() -> str:
-    """Check the buffer's sync valuePaths against fields seen by the last probe; flags
-    bindings that would silently show no data (wrong path / namespace)."""
+    """Run the buffer's listen syncs against the frames the last probe saw, with the
+    app's own filter/valuePath rules; flags bindings that would silently show no data.
+    Reports FILTER_MISS (with near-misses such as a msg_type typo), PATH_MISSING (the
+    failing segment) and TYPE_UNRENDERABLE. On a carterkit without `wire` it falls
+    back to flagging valuePaths never seen in traffic."""
     if state.work_buffer is None:
         return "No active buffer. Call begin_edit first."
     paths = probe.candidate_paths(state.last_probe_events)
-    if not paths:
+    if not paths and not state.last_probe_frames:
         return "No probe data yet. Run probe_service first."
-    findings = autowire.live_data_lint(state.work_buffer.layout, paths)
-    if not findings:
-        return "✓ Every synced valuePath was seen in observed traffic."
-    return "⚠ Paths not seen in traffic:\n" + "\n".join(
-        f"  - {f['id']}: {f['detail']}" for f in findings)
+    findings = wirecheck.lint_traffic(state.work_buffer.layout, state.last_probe_frames,
+                                      event=state.last_probe_event, known_paths=paths)
+    return wirecheck.format_findings(findings)
 
 
 @mcp.tool()
