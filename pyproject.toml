@@ -12,7 +12,7 @@ requires-python = ">=3.11"
 # The layout-authoring engine (catalog, buffer, grid, validate, codegen, infer,
 # theming, tune) comes from carterkit; meshsocket arrives transitively via it.
 dependencies = [
-    "carterkit>=0.5.0",
+    "carterkit>=0.14.0",  # 0.14.0 ships carterkit.patch (diff/layout_hash) for push_buffer patches
     "mcp>=1.0,<2",  # 2.x removed mcp.server.fastmcp; app.py uses the 1.x FastMCP API
     "qrcode[pil]>=7.4",
 ]

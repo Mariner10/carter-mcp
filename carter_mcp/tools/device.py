@@ -64,14 +64,24 @@ async def save_layout(layout_json: str = "", layout_path: str = "") -> str:
 
 
 @mcp.tool()
-async def push_buffer() -> str:
-    """Push the working buffer to the paired device (truthful apply with a rendered
-    echo when a single device is paired). Edits stay in the buffer for further work."""
+async def push_buffer(full: bool = False) -> str:
+    """Push the working buffer to the paired device. Edits stay in the buffer.
+
+    After the first full push, later pushes send a small `patch-layout` (only the
+    changed controls) against the layout the device last acknowledged — a hot
+    reload that keeps live values, and no 256 KB frame-size risk. It falls back
+    to one full apply-layout (and says why) when the app is too old, nothing was
+    acknowledged yet, the change can't be expressed as a patch, or the device
+    refuses the base. The output says `hot` or `full` reload.
+
+    Args:
+        full: Force a full apply-layout instead of a patch.
+    """
     if state.work_buffer is None:
         return "No active buffer. Call begin_edit first."
     if err := mesh.connection_error():
         return err
-    return await mesh.apply_or_broadcast(state.work_buffer.layout)
+    return await mesh.patch_push(state.work_buffer.layout, full=full)
 
 
 @mcp.tool()

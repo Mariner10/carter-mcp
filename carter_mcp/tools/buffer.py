@@ -78,6 +78,8 @@ async def begin_edit(name: str = "Untitled", columns: int = 4, rows: int = 8,
     if from_device:
         if mesh.connection_error():
             return "Not connected — can't read the device. Call connect first (or omit from_device)."
+        # Read-modify-write starts from the device's own copy; the next push is full.
+        mesh.clear_acked()
         layout = await mesh.fetch_device_layout_obj()
         if not layout:
             return "Couldn't read a layout off the device (none loaded, or it didn't respond)."

@@ -31,6 +31,17 @@ active_token: Optional[str] = None
 # editor itself dials loopback), so the two can differ.
 active_qr_url: Optional[str] = None
 
+# The last layout the paired device ACKNOWLEDGED (ok apply-layout / patch-layout),
+# the base `push_buffer` diffs against for a small `patch-layout` (K12). The hash
+# prefers the device-reported one (the app hashes its own re-encoded JSON).
+# Cleared on reconnect, device change and begin_edit(from_device=…).
+acked_layout: Optional[dict] = None
+acked_hash: Optional[str] = None
+acked_device_id: Optional[str] = None
+# Does the paired device answer patch-layout? Cached per pairing (device id).
+patch_support: Optional[bool] = None
+patch_support_device: Optional[str] = None
+
 # Zero-config authoring transport: an in-process, auth-free MeshSocket relay.
 local_relay = None
 local_relay_task: Optional[asyncio.Task] = None

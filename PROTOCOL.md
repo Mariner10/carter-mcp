@@ -290,8 +290,10 @@ Request payload:
     { "op": "layout", "set": { "accentColor": "#7CFFB2" } },
     { "op": "renameTab", "from": "Power", "to": "Energy" } ] }
 ```
-Op kinds: `update`, `add`, `remove`, `move`, `layout`, `renameTab` — the MCP rejects
-anything else before sending. Reply:
+Op kinds: `update`, `add`, `remove`, `move`, `layout`, `renameTab`, plus the rest of
+the app's `LayoutOp` vocabulary that `carterkit.patch.diff` emits (`setTab`,
+`addTab`, `moveTab`, `add{parent,index}`, `move{parent,index}`, …; validated with
+`carterkit.patch.decode_op`) — the MCP rejects anything else before sending. Reply:
 ```json
 { "ok": true, "hash": "sha256:41ab…", "applied": 6, "reload": "hot",
   "rendered": { "…same summary shape as apply-layout…" } }
@@ -301,6 +303,22 @@ anything else before sending. Reply:
 - Stale base: `{ "ok": false, "error": "stale-base", "hash": "sha256:…" }` — the MCP
   falls back to a full `apply-layout`. Retrying an applied patch yields `stale-base`,
   never a double apply.
+
+**How the MCP uses it (`push_buffer`, K12).** Needs `carterkit>=0.14.0`
+(`carterkit.patch`).
+- Every ok `apply-layout` or `patch-layout` reply records the pushed layout as the
+  *acknowledged base*; its hash is the reply's `hash` when present (the app hashes its
+  own re-encoded JSON), else `carterkit.patch.layout_hash(layout)`. A failed apply or
+  a broadcast forgets the base. Reconnect (`connect`/`disconnect`/socket teardown), a
+  different device id, and `begin_edit(from_device=…)` clear it too.
+- `push_buffer` patches only when a single device is paired, that device advertises
+  `verb.patch-layout` in `get-device-info.features` (or `protocolVersion >= 3`;
+  answer cached per pairing), a base is acknowledged, and `diff(base, buffer)` returns
+  a list. An empty list is still sent, to verify the base.
+- Otherwise — or on `stale-base`, no reply, a relay/socket error, or any other error —
+  it sends exactly one full `apply-layout` and prefixes the output with the reason:
+  `Full push · full reload (<why>)`. A patch reports `Patched N ops · hot reload
+  (values kept)` or `… · full reload`. `push_buffer(full=True)` forces the full push.
 
 ### `trace-control`  (studio-only, DRAFT — pending app implementation)
 Pull (not stream) why a control is or isn't getting data. Sits beside

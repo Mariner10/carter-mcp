@@ -69,6 +69,7 @@ async def connect(channel: str = "editor", role: str = "editor",
             transport_note = f"gateway {state.active_url}"
     state.current_channel = channel
     state.device_connected_event = asyncio.Event()
+    mesh.clear_acked(support=True)   # a new session never inherits a patch base
 
     state.socket = MeshSocket(
         url=state.active_url,

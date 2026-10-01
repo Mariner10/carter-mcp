@@ -576,11 +576,21 @@ def format_snapshot_report(resp) -> str:
 
 PATCH_OP_KINDS = ("update", "add", "remove", "move", "layout", "renameTab")
 
+# The rest of the app's LayoutOp vocabulary (carter-c1n.8), which
+# `carterkit.patch.diff` also emits (e.g. `setTab`, `add{parent}`) — K12 sends the
+# differ's output as-is. These are checked by `carterkit.patch.decode_op`.
+KIT_PATCH_OP_KINDS = ("setProp", "set", "unset", "setSync", "setAction", "duplicate",
+                      "resize", "place", "renameId", "setLayout", "setTheme", "addTab",
+                      "removeTab", "moveTab", "setTab", "upsertSource", "removeSource")
+
 
 def _validate_patch_op(i: int, op) -> None:
     if not isinstance(op, dict):
         raise ValueError(f"ops[{i}] must be an object")
     kind = op.get("op")
+    if kind in KIT_PATCH_OP_KINDS:
+        _kit_check_op(i, op)
+        return
     if kind not in PATCH_OP_KINDS:
         raise ValueError(f"ops[{i}]: unknown op kind {kind!r} "
                          f"(expected one of {', '.join(PATCH_OP_KINDS)})")
@@ -595,21 +605,40 @@ def _validate_patch_op(i: int, op) -> None:
         ctl = op.get("control")
         if not isinstance(ctl, dict) or not ctl.get("id"):
             raise ValueError(f"ops[{i}] (add) needs a `control` object with an `id`")
-        if not (isinstance(op.get("tab"), str) and op["tab"]):
-            raise ValueError(f"ops[{i}] (add) needs a target `tab` title")
-    if kind == "move" and not any(k in op for k in ("position", "span", "tab")):
-        raise ValueError(f"ops[{i}] (move) needs `position`, `span` and/or `tab`")
+        has_tab = isinstance(op.get("tab"), str) and op["tab"]
+        parent = op.get("parent")
+        has_parent = (isinstance(parent, str) and parent) or (
+            isinstance(parent, int) and not isinstance(parent, bool) and parent >= 0)
+        if not (has_tab or has_parent):
+            raise ValueError(f"ops[{i}] (add) needs a target `tab` title or `parent` ref")
+    if kind == "move" and not any(k in op for k in ("position", "span", "tab",
+                                                     "parent", "index", "panel")):
+        raise ValueError(f"ops[{i}] (move) needs `position`, `span`, `tab`/`parent` and/or `index`")
     if kind == "renameTab":
         if not all(isinstance(op.get(k), str) and op[k] for k in ("from", "to")):
             raise ValueError(f"ops[{i}] (renameTab) needs `from` and `to` tab titles")
 
 
-def build_patch_layout_request(base: str, ops: list) -> dict:
+def _kit_check_op(i: int, op: dict) -> None:
+    """Validate a kit-vocabulary op with carterkit's own decoder (the applier's
+    twin), when the installed carterkit ships `carterkit.patch`."""
+    try:
+        from carterkit import patch as _patch
+    except ImportError:
+        return
+    try:
+        _patch.decode_op(op)
+    except ValueError as e:   # PatchError subclasses ValueError
+        raise ValueError(f"ops[{i}] ({op.get('op')}): {e}") from e
+
+
+def build_patch_layout_request(base: str, ops: list, allow_empty: bool = False) -> dict:
     """`patch-layout` payload: id-addressed ops against the layout hashed `base`.
-    Raises ValueError on an unknown op kind or a malformed op."""
+    Raises ValueError on an unknown op kind or a malformed op. `allow_empty`
+    permits `ops: []` — K12 sends an empty patch to verify the base."""
     if not isinstance(base, str) or not base:
         raise ValueError("base must be the last-acknowledged layout hash (e.g. 'sha256:…')")
-    if not isinstance(ops, list) or not ops:
+    if not isinstance(ops, list) or (not ops and not allow_empty):
         raise ValueError("ops must be a non-empty list")
     for i, op in enumerate(ops):
         _validate_patch_op(i, op)

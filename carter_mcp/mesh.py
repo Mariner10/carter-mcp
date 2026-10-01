@@ -10,6 +10,7 @@ handles live in `state`.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -134,6 +135,33 @@ async def cleanup_socket() -> None:
     state.current_channel = None
     state.peer_list = []
     state.device_connected_event = None
+    clear_acked(support=True)
+
+
+def clear_acked(support: bool = False) -> None:
+    """Forget the device-acknowledged patch base (and, with `support`, the cached
+    patch-layout capability) — the next push_buffer is a full apply."""
+    state.acked_layout = None
+    state.acked_hash = None
+    state.acked_device_id = None
+    if support:
+        state.patch_support = None
+        state.patch_support_device = None
+
+
+def record_ack(layout: dict, device_id, reply_hash=None) -> None:
+    """Remember `layout` as the device's acknowledged base. The device-reported
+    hash wins; else the canonical carterkit hash of what we sent."""
+    state.acked_layout = copy.deepcopy(layout)
+    state.acked_device_id = device_id
+    if isinstance(reply_hash, str) and reply_hash:
+        state.acked_hash = reply_hash
+    else:
+        try:
+            from carterkit import patch as _patch
+            state.acked_hash = _patch.layout_hash(layout)
+        except Exception:
+            state.acked_hash = None
 
 
 def connection_error() -> Optional[str]:
@@ -208,20 +236,35 @@ async def routed_request(verb: str, payload, on_ok, timeout: float = 5.0) -> str
     return protocol.format_routed_response(result, on_ok=on_ok, verb=verb)
 
 
+async def apply_routed(layout: dict, device_id: str):
+    """Routed apply-layout to `device_id` → (tool text, raw reply). An ok reply
+    records `layout` as the acknowledged patch base (device hash preferred); any
+    other outcome forgets the base, since the device's layout is then unknown."""
+    result = await state.socket.request("route_msg", {
+        "target_id": device_id,
+        "type": "apply-layout",
+        "payload": protocol.build_apply_layout_request(layout),
+    }, timeout=5.0)
+    if isinstance(result, dict) and result.get("ok"):
+        record_ack(layout, device_id, result.get("hash"))
+    else:
+        clear_acked()
+    text = protocol.format_routed_response(
+        result, on_ok=protocol.format_apply_result, verb="apply-layout")
+    return text, result
+
+
 async def apply_or_broadcast(layout: dict) -> str:
     """Send a layout to the device truthfully when a single device is resolvable
     (routed apply-layout with a rendered echo), else broadcast to all viewers.
     Shared by push_layout and push_buffer."""
     device_id = await get_device_id()
     if protocol.should_push_routed(device_id):
-        result = await state.socket.request("route_msg", {
-            "target_id": device_id,
-            "type": "apply-layout",
-            "payload": protocol.build_apply_layout_request(layout),
-        }, timeout=5.0)
-        return protocol.format_routed_response(
-            result, on_ok=protocol.format_apply_result, verb="apply-layout")
+        text, _raw = await apply_routed(layout, device_id)
+        return text
 
+    # A broadcast is never acknowledged, so the device's base is unknown now.
+    clear_acked()
     payload = dict(layout)
     payload["msg_type"] = "layout-update"
     try:
@@ -234,6 +277,96 @@ async def apply_or_broadcast(layout: dict) -> str:
         return "Failed to send — MeshSocket connection lost. Try reconnecting."
     except Exception as e:
         return f"Failed to push layout: {e}"
+
+
+async def device_patch_support(device_id: str) -> Optional[bool]:
+    """Does `device_id` answer patch-layout? Reads the RAW get-device-info reply
+    (so a `features` list counts even before extract_device_info keeps it) and
+    caches a definite answer per pairing. None = unknown (no/odd reply)."""
+    if state.patch_support_device == device_id and state.patch_support is not None:
+        return state.patch_support
+    try:
+        result = await state.socket.request("route_msg", {
+            "target_id": device_id, "type": "get-device-info", "payload": None,
+        }, timeout=4.0)
+    except Exception:
+        result = None
+    info = result if isinstance(result, dict) and "error" not in result else None
+    supported = protocol.device_supports(info, "patch-layout")
+    if supported is not None:
+        state.patch_support = supported
+        state.patch_support_device = device_id
+    return supported
+
+
+async def _try_patch(layout: dict, device_id: str):
+    """One patch-layout attempt → (tool text, None) on success, or (None, reason)
+    when the caller must full-push instead. Never sends more than one request."""
+    if state.acked_device_id != device_id:
+        clear_acked()   # a different device paired since the last ack
+    if state.acked_layout is None or not state.acked_hash:
+        return None, "no acknowledged base yet"
+    supported = await device_patch_support(device_id)
+    if supported is None:
+        return None, "device did not report its capabilities"
+    if not supported:
+        return None, f"older app — {protocol.too_old_message('patch-layout')}"
+    try:
+        from carterkit import patch as _patch
+    except ImportError:
+        return None, "installed carterkit has no carterkit.patch (pip install -U carterkit)"
+    ops = _patch.diff(state.acked_layout, layout)
+    if ops is None:
+        return None, "change not expressible as a patch (tab structure / ids)"
+    try:
+        payload = protocol.build_patch_layout_request(state.acked_hash, ops, allow_empty=True)
+    except ValueError as e:
+        return None, f"patch op rejected locally: {e}"
+    try:
+        result = await state.socket.request("route_msg", {
+            "target_id": device_id, "type": "patch-layout", "payload": payload,
+        }, timeout=5.0)
+    except Exception as e:
+        return None, f"relay error on patch-layout: {e}"
+    if result is None:
+        return None, "device did not answer patch-layout"
+    if protocol.is_stale_base(result):
+        return None, "stale-base (the device's layout changed since the last push)"
+    if isinstance(result, dict) and result.get("ok"):
+        record_ack(layout, device_id, result.get("hash"))
+        n = result.get("applied", len(ops))
+        reload = result.get("reload")
+        how = {"hot": "hot reload (values kept)",
+               "full": "full reload (wiring changed; values reset)"}.get(
+                   reload, f"reload {reload or '?'}")
+        head = f"Patched {n} op{'s' if n != 1 else ''} · {how}"
+        rest = protocol.format_patch_result(result).split("\n")[1:]
+        return "\n".join([head] + rest), None
+    if isinstance(result, dict) and "error" in result:
+        detail = protocol.studio_error_message(result, "patch-layout") or result["error"]
+        return None, f"patch-layout error: {detail}"
+    return None, f"unexpected patch-layout reply: {result!r}"
+
+
+async def patch_push(layout: dict, full: bool = False) -> str:
+    """push_buffer's transport (K12): send a small `patch-layout` against the last
+    device-acknowledged layout (hot reload keeps live values; dodges the 256 KB
+    frame cap), else exactly one full apply-layout, prefixed with why.
+
+    Patches only when a single device is paired, it advertises patch-layout, a
+    base was acknowledged on this pairing and `carterkit.patch.diff` can express
+    the change (an empty diff is still sent, to verify the base)."""
+    if full:
+        reason = "full=True"
+    else:
+        device_id = await get_device_id()
+        if not protocol.should_push_routed(device_id):
+            reason = "no single device paired"
+        else:
+            text, reason = await _try_patch(layout, device_id)
+            if text is not None:
+                return text
+    return f"Full push · full reload ({reason})\n" + await apply_or_broadcast(layout)
 
 
 async def save_layout_obj(layout: dict) -> str:
