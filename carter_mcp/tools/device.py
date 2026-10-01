@@ -217,6 +217,76 @@ async def save_device_layout(layout_json: str = "", filename: str = "",
     return await mesh.persist_layout_obj(layout, filename=filename)
 
 
+# trace-control is a quick local snapshot on the phone; an older app never answers,
+# so wait less than the relay's 5 s before falling back.
+TRACE_TIMEOUT_S = 3.0
+FALLBACK_PROBE_S = 4
+
+
+def _trace_reason(reply) -> str:
+    """Why the fallback ran, for the line under the prefix."""
+    if reply is None:
+        return (f"no reply within {protocol._num(TRACE_TIMEOUT_S)} s: an app without "
+                f"trace-control, a sleeping phone, or no paired device")
+    if (msg := protocol.studio_error_message(reply, "trace-control")):
+        return msg
+    if isinstance(reply, dict) and "error" in reply:
+        return f"relay error: {reply['error']}"
+    return "unexpected reply shape"
+
+
+@mcp.tool()
+async def explain_control(control_id: str, frames: int = 20) -> str:
+    """Why is control X blank (or wrong)? Asks the phone for its own trace of the
+    control (`trace-control`: sync registrations, delivered/miss counters, findings
+    such as FILTER_MISS / PATH_MISSING / NO_FRAMES / E2EE_DROP, recent frame verdicts,
+    action outcomes) and prints a verdict plus plain-English findings.
+
+    If the app does not answer (older CAR-TER, timeout, error), falls back to an
+    outside-in check: the control's syncs from the device layout (or the working
+    buffer) judged against traffic the MCP observed (the last probe_service run, or
+    a short probe now) with the app's own matching rules, plus the seen-paths lint.
+    In an E2EE room that traffic is ciphertext, and the answer says so.
+
+    Args:
+        control_id: The id of the control to explain.
+        frames: How many recent frame verdicts the phone should include (default 20).
+    """
+    if err := mesh.connection_error():
+        return err
+    try:
+        payload = protocol.build_trace_control_request(control_id, frames=frames)
+    except ValueError as e:
+        return str(e)
+    reply = await mesh.routed_reply("trace-control", payload, timeout=TRACE_TIMEOUT_S)
+    if not protocol.trace_unanswered(reply):
+        return protocol.format_trace_control(reply)
+
+    # Fallback: outside-in, from traffic the MCP can see.
+    from carter_mcp import probe, wirecheck
+    from carter_mcp.tools.wiring import probe_service
+
+    layout = None
+    try:
+        layout = await mesh.fetch_device_layout_obj()
+    except Exception:
+        layout = None
+    if not isinstance(layout, dict) and state.work_buffer is not None:
+        layout = state.work_buffer.layout
+    ctl = wirecheck.find_control(layout, control_id) if isinstance(layout, dict) else None
+    event = "broadcast"
+    for s in (ctl or {}).get("sync") or []:
+        if isinstance(s, dict) and s.get("type", "listen") == "listen":
+            event = s.get("event") or "broadcast"
+            break
+    if ctl is not None and (not state.last_probe_frames or state.last_probe_event != event):
+        await probe_service(seconds=FALLBACK_PROBE_S, event=event)
+    return wirecheck.explain_fallback(
+        layout, control_id, state.last_probe_frames, event=state.last_probe_event,
+        known_paths=probe.candidate_paths(state.last_probe_events),
+        reason=_trace_reason(reply))
+
+
 @mcp.tool()
 async def watch_traffic(seconds: int = 10, filter: str = "") -> str:
     """Watch the live data flowing into the paired device's layout for a window and

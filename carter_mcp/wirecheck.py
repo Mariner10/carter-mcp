@@ -15,7 +15,7 @@ import copy
 import json
 from typing import Any, Optional
 
-from carter_mcp import autowire
+from carter_mcp import autowire, protocol
 from carter_mcp import simulate as simulate_lib
 
 try:
@@ -159,3 +159,107 @@ def simulate_report(layout: dict, payload: Any, event: str = "broadcast") -> lis
         code, detail = describe(_evaluate(payload, ctype, sync))
         lines.append(f"  - {cid}: {code} {detail}")
     return lines
+
+
+# ─── explain_control fallback (K15): outside-in, from traffic the MCP saw ─────
+
+E2EE_NOTE = ("This layout is end-to-end encrypted (connection.e2eeKey): the observed "
+             "traffic is ciphertext (sealed envelopes), so the MCP cannot read the "
+             "values. Verdicts below judge the envelopes, not the data; update "
+             "CAR-TER for trace-control, or use watch_traffic, to see decrypted values.")
+
+
+def find_control(layout: dict, control_id: str) -> Optional[dict]:
+    hits: list[dict] = []
+
+    def visit(ch: dict):
+        if ch.get("id") == control_id:
+            hits.append(ch)
+
+    for tab in (layout or {}).get("tabs", []):
+        autowire._walk(tab.get("children"), visit)
+    return hits[0] if hits else None
+
+
+def is_e2ee(layout: dict) -> bool:
+    conn = (layout or {}).get("connection")
+    return isinstance(conn, dict) and bool(conn.get("e2eeKey"))
+
+
+def _sync_desc(s: dict) -> str:
+    desc = f"sync on '{s.get('event') or 'broadcast'}'"
+    if isinstance(s.get("filter"), dict) and s["filter"]:
+        desc += f" filter {json.dumps(s['filter'], separators=(',', ':'))[:60]}"
+    if s.get("valuePath"):
+        desc += f" path {s['valuePath']}"
+    return desc
+
+
+def explain_fallback(layout: Optional[dict], control_id: str, frames: list,
+                     event: str = "broadcast", known_paths=None,
+                     reason: Optional[str] = None) -> str:
+    """explain_control's answer when the phone did not answer trace-control:
+    the control's listen syncs judged against `frames` (observed on `event`) with
+    carterkit.wire, plus the seen-paths lint. Always starts with
+    `protocol.TRACE_FALLBACK_PREFIX`; E2EE layouts get `E2EE_NOTE`."""
+    head = [protocol.TRACE_FALLBACK_PREFIX]
+    if reason:
+        head.append(f"(Phone reply: {reason})")
+    if not layout:
+        return "\n".join(head + ["No layout to check: the device did not return its "
+                                 "layout and there is no working buffer (begin_edit)."])
+    ctl = find_control(layout, control_id)
+    if ctl is None:
+        return "\n".join(head + [f"No control '{control_id}' in the layout."])
+    if is_e2ee(layout):
+        head.append(E2EE_NOTE)
+    ctype = ctl.get("type")
+    syncs = [s for s in ctl.get("sync") or []
+             if isinstance(s, dict) and s.get("type", "listen") == "listen"]
+    if not syncs:
+        return "\n".join(head + [f"{control_id}: has no listen sync, so nothing feeds it. "
+                                 "Wire it (autowire_buffer or update_control)."])
+    body: list[str] = []
+    codes: list[str] = []
+    ok = judged = 0
+    for s in syncs:
+        sev = s.get("event") or "broadcast"
+        body.append(f"  {_sync_desc(s)}")
+        if sev != event:
+            body.append(f"    not judged: the observed traffic was on '{event}'. "
+                        f"Run probe_service(event='{sev}') first.")
+            continue
+        if not frames:
+            judged += 1
+            codes.append("NO_FRAMES")
+            body.append("    - " + protocol.explain_finding({"code": "NO_FRAMES", "event": sev}))
+            continue
+        if wire is None:
+            continue  # the seen-paths lint below is all an old kit can say
+        judged += 1
+        outcomes = [_evaluate(f, ctype, s) for f in frames]
+        hit = sum(1 for o in outcomes if o.delivered)
+        if hit:
+            ok += 1
+            body.append(f"    OK: {hit} of {len(frames)} observed frame(s) would reach it.")
+            continue
+        f = _sync_finding(control_id, ctype, s, frames)
+        codes.append(f["code"])
+        body.append(f"    - {f['code']}: {f['detail']} ({len(frames)} frame(s) checked)")
+    if known_paths:
+        for f in autowire.live_data_lint(layout, known_paths):
+            if f["id"] == control_id:
+                codes.append("PATH_NOT_SEEN")
+                body.append(f"    - PATH_NOT_SEEN: {f['detail']}")
+    uniq = list(dict.fromkeys(codes))
+    if uniq and not ok:
+        verdict = f"{control_id}: NOT receiving data (outside-in): {', '.join(uniq)}"
+    elif uniq:
+        verdict = f"{control_id}: some syncs would receive data, but {', '.join(uniq)}"
+    elif ok:
+        verdict = f"{control_id}: OK, observed traffic would reach it"
+    elif judged == 0:
+        verdict = f"{control_id}: could not judge from the observed traffic"
+    else:
+        verdict = f"{control_id}: no problem found in the observed traffic"
+    return "\n".join(head + [verdict] + body)

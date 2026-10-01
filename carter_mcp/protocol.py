@@ -705,3 +705,176 @@ def format_trace(resp) -> str:
                 bit += f" ({_num(a['rtt_ms'])} ms)"
             lines.append(bit)
     return "\n".join(lines)
+
+
+# ─── explain_control (K15): trace-control findings in plain English ───────────
+#
+# Finding shape (deep-dives/14-wire-inspector.md "Finding"):
+#   {"code": "FILTER_MISS", "control": "temp", "event": "broadcast",
+#    "detail": {"key": "msg_type", "expected": "telemetery", "seen": [...]},
+#    "count": 12, "lastAt": 1790300123456}
+
+_E2EE_LABELS = {
+    "malformed": "the sealed envelope was malformed",
+    "badTag": "it failed authentication (the hub and the phone hold different keys)",
+    "stale": "it was too old (clock skew or a delayed frame)",
+    "wrongChannel": "it was sealed for a different channel",
+    "replay": "it was a replay of a frame already seen",
+    "plaintext": "it arrived in plaintext in an encrypted room, so the phone refused it",
+}
+
+
+def _j(v, n: int = 60) -> str:
+    return json.dumps(v)[:n] if not isinstance(v, str) else repr(v)[:n]
+
+
+def _finding_text(code: str, d: dict, event: str) -> Optional[str]:
+    """Plain-English sentence for one known finding code, or None if unknown."""
+    on = f" on '{event}'" if event else ""
+    if code == "NO_FRAMES":
+        return (f"No frames arrived{on} in the window. If your hub is running "
+                f"(check the roster), check the event name: the phone only hears "
+                f"events it listens for, so a misspelled event looks like silence.")
+    if code == "FILTER_MISS":
+        key = d.get("key")
+        if key is not None:
+            seen = d.get("seen")
+            seen_s = (", ".join(_j(s, 30) for s in seen[:5]) if isinstance(seen, list)
+                      else _j(seen, 60) if seen is not None else "nothing")
+            return (f"Frames arrived{on} but none matched the filter: '{key}' must be "
+                    f"{_j(d.get('expected'))}, frames had {seen_s}.")
+        return f"Frames arrived{on} but none matched the sync's filter."
+    if code == "PATH_MISSING":
+        seg = d.get("segment")
+        idx = d.get("index")
+        where = f" at segment '{seg}'" if seg is not None else ""
+        if isinstance(idx, int):
+            where += f" (#{idx + 1})"
+        return f"Frames matched, but the valuePath does not exist in them{where}."
+    if code == "TYPE_UNRENDERABLE":
+        return ("The value at the path is an object or array; this control shows only "
+                "a bool, number or string. Point valuePath at a leaf.")
+    if code == "HELD_PENDING":
+        return ("Incoming values are being held while a local change on this control "
+                "is pending; they apply once it settles.")
+    if code == "E2EE_DROP":
+        label = d.get("label")
+        why = _E2EE_LABELS.get(label, f"reason '{label}'" if label else "an unknown reason")
+        return f"Encrypted frames were dropped before reaching the control: {why}."
+    if code == "NO_HUB_ON_CHANNEL":
+        return ("No hub is on the layout's channel, so nothing is sending data. Start "
+                "the hub, or check it joined the same channel/account.")
+    if code == "NOT_CONNECTED":
+        return "The layout's socket is not connected to the relay."
+    if code == "SEND_NO_SOCKET":
+        return ("The control's action was sent while there was no socket, so it was "
+                "silently dropped.")
+    if code == "ACK_TIMEOUT":
+        return "A command was sent but its ack never came back in time."
+    if code == "ACK_REJECTED":
+        reason = d.get("reason") or d.get("error")
+        return "The hub rejected the command" + (f": {reason}." if reason else ".")
+    if code == "REQUEST_TIMEOUT":
+        return ("The action's request got no reply within 5 s; the app discards that "
+                "result, so the control gave no sign of failure.")
+    return None
+
+
+def explain_finding(f) -> str:
+    """One finding → one line. Unknown codes pass through raw."""
+    if isinstance(f, str):
+        return f
+    if not isinstance(f, dict):
+        return json.dumps(f)
+    code = str(f.get("code") or "?")
+    detail = f.get("detail") if isinstance(f.get("detail"), dict) else {}
+    text = _finding_text(code, detail, f.get("event") or "")
+    if text is None:
+        raw = {k: v for k, v in f.items() if k not in ("code", "control")}
+        text = (f.get("message") or json.dumps(raw, separators=(",", ":"))) if raw else ""
+        text = text or "(no detail)"
+    count = f.get("count")
+    suffix = f" (x{_num(count)})" if isinstance(count, (int, float)) and count > 1 else ""
+    return f"{code}: {text}{suffix}"
+
+
+def control_verdict(c: dict) -> str:
+    """The one-line verdict for one traced control."""
+    cid = c.get("id", "?")
+    regs = [r for r in c.get("registrations") or [] if isinstance(r, dict)]
+    codes = []
+    for f in c.get("findings") or []:
+        code = f.get("code") if isinstance(f, dict) else None
+        if code and code not in codes:
+            codes.append(str(code))
+    delivered = sum(r.get("delivered") or 0 for r in regs
+                    if isinstance(r.get("delivered"), (int, float)))
+    if delivered and not codes:
+        return f"{cid}: OK, receiving data ({_num(delivered)} delivered)"
+    if delivered:
+        return f"{cid}: receiving data ({_num(delivered)} delivered), but {', '.join(codes)}"
+    if codes:
+        return f"{cid}: NOT receiving data: {', '.join(codes)}"
+    if not regs:
+        return f"{cid}: has no sync registrations, so nothing feeds it"
+    return f"{cid}: no data delivered yet, and the phone reported no findings"
+
+
+def format_trace_control(resp) -> str:
+    """explain_control's view of a trace-control reply: a verdict line per
+    control, then its findings in plain English, then the raw counters."""
+    if (err := studio_error_message(resp, "trace-control")):
+        return err
+    if not isinstance(resp, dict):
+        return f"Unexpected trace-control reply: {resp!r}"
+    window = resp.get("window_s")
+    controls = [c for c in resp.get("controls") or [] if isinstance(c, dict)]
+    lines = ["From the phone's own trace" + (f" (last {_num(window)}s)" if window is not None else "") + ":"]
+    if not controls:
+        lines.append("No controls traced (unknown id?).")
+    for c in controls:
+        lines.append(control_verdict(c))
+        for f in c.get("findings") or []:
+            lines.append("  - " + explain_finding(f))
+        for r in c.get("registrations") or []:
+            if not isinstance(r, dict):
+                continue
+            desc = r.get("event", "?")
+            if r.get("filter"):
+                desc += f" filter {json.dumps(r['filter'], separators=(',', ':'))}"
+            if r.get("valuePath"):
+                desc += f" path {r['valuePath']}"
+            counts = ", ".join(f"{k} {_num(r[k])}" for k in _TRACE_COUNTERS if k in r)
+            lines.append(f"  sync {desc}" + (f": {counts}" if counts else ""))
+        frames = [fr for fr in c.get("frames") or [] if isinstance(fr, dict)]
+        if frames:
+            tally: dict[str, int] = {}
+            for fr in frames:
+                v = str(fr.get("verdict", "?"))
+                tally[v] = tally.get(v, 0) + 1
+            lines.append(f"  recent frames ({len(frames)}): "
+                         + ", ".join(f"{v} x{n}" for v, n in sorted(tally.items())))
+        for a in c.get("actions") or []:
+            if isinstance(a, dict):
+                bit = f"  action {a.get('event', '?')}" + (f" {a['cmd']}" if a.get("cmd") else "")
+                bit += f" -> {a.get('outcome', '?')}"
+                if a.get("rtt_ms") is not None:
+                    bit += f" ({_num(a['rtt_ms'])} ms)"
+                lines.append(bit)
+    return "\n".join(lines)
+
+
+TRACE_FALLBACK_PREFIX = ("Could not see inside the phone (app did not answer "
+                         "trace-control); this is based on traffic the MCP observed.")
+
+
+def trace_unanswered(resp) -> bool:
+    """True when explain_control must fall back: no reply (timeout / older app),
+    a relay error (e.g. unknown verb) or any `ok:false` reply."""
+    if not isinstance(resp, dict):
+        return True
+    if resp.get("ok") is False:
+        return True
+    if "error" in resp and resp.get("ok") is not True:
+        return True
+    return "controls" not in resp

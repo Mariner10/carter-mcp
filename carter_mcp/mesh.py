@@ -208,6 +208,22 @@ async def routed_request(verb: str, payload, on_ok, timeout: float = 5.0) -> str
     return protocol.format_routed_response(result, on_ok=on_ok, verb=verb)
 
 
+async def routed_reply(verb: str, payload, timeout: float = 5.0):
+    """Like `routed_request` but returns the raw reply (None on no device, timeout
+    or a send error) so a caller can decide to fall back. Assumes connected."""
+    device_id = await get_device_id()
+    if not device_id:
+        return None
+    try:
+        return await state.socket.request("route_msg", {
+            "target_id": device_id,
+            "type": verb,
+            "payload": payload,
+        }, timeout=timeout)
+    except Exception as e:  # relay hiccup: treat like no answer, keep the reason
+        return {"ok": False, "error": "request-failed", "reason": str(e)}
+
+
 async def apply_or_broadcast(layout: dict) -> str:
     """Send a layout to the device truthfully when a single device is resolvable
     (routed apply-layout with a rendered echo), else broadcast to all viewers.

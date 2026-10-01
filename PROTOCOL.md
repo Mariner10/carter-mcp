@@ -321,6 +321,28 @@ Reply:
   "actions": [ { "at": 0, "event": "broadcast_request", "cmd": "…",
       "outcome": "ack", "rtt_ms": 84 } ] } ] }
 ```
+- **Studio-only.** Answered on the paired studio socket only, never on the layout
+  socket (not in `layoutSocketVerbs`) — the reply carries post-decrypt values, the
+  same trust boundary `watch-traffic` crosses.
+- **Payload samples are truncated to 1 KB** (`frames[].value`, the
+  `truncatedTrafficValue` cap) and marked `"truncated": true`.
+- Each `findings[]` entry is a Finding:
+  `{"code", "control", "event", "detail": {…}, "count", "lastAt"}`. Codes:
+  `NO_FRAMES`, `FILTER_MISS {key, expected, seen}`, `PATH_MISSING {segment, index}`,
+  `TYPE_UNRENDERABLE`, `HELD_PENDING`, `E2EE_DROP {label}` (`malformed`, `badTag`,
+  `stale`, `wrongChannel`, `replay`, `plaintext`), `NO_HUB_ON_CHANNEL`,
+  `NOT_CONNECTED`, `SEND_NO_SOCKET`, `ACK_TIMEOUT`, `ACK_REJECTED`,
+  `REQUEST_TIMEOUT`. Clients print unknown codes raw.
+
+MCP tool `explain_control(control_id, frames=20)` sends this with a ~3 s timeout
+(feature-detect by asking; no `features` check needed) and prints one verdict line
+per control plus its findings in plain English. On no reply, a relay error or any
+`ok:false` it **falls back** to an outside-in check — the control's syncs from
+`get-current-layout` (full) or the work buffer, judged against the frames the MCP
+itself observed (last `probe_service`, or a short probe) with `carterkit.wire`, plus
+the seen-paths lint — prefixed "Could not see inside the phone (app did not answer
+trace-control); this is based on traffic the MCP observed." When the layout has
+`connection.e2eeKey`, the fallback says the observed traffic is ciphertext.
 
 ### `provision-device` + `get-provision-result`  (hub credential mint, human-gated)
 Mint a Hub credential for a channel through the phone — the studio-session version of
