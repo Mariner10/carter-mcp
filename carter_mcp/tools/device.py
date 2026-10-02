@@ -168,26 +168,28 @@ async def snapshot_device(tab: str = "", mode: str = "window", scale: float = 1)
     # Capability first: an older app never answers the verb, so say "update"
     # instead of waiting out the timeout.
     # One bounded probe: a device that can't answer get-device-info won't answer
-    # render-snapshot either, so stop here rather than wait out two 10 s calls.
+    # render-snapshot either, so stop here rather than wait out two more calls.
     try:
         info = await mesh.routed_call("get-device-info", None,
                                       timeout=protocol.DEVICE_INFO_TIMEOUT_S,
                                       device_id=device_id)
     except Exception as e:
         return f"{protocol.DEVICE_NO_ANSWER_ADVICE} ({type(e).__name__}: {e})"
-    if info is None:
+    if info is None or protocol.is_route_timeout(info):
         return protocol.DEVICE_NO_ANSWER_ADVICE
     if protocol.device_supports(info, "render-snapshot") is False:
         return protocol.snapshot_error_advice(None, info)
     resp = None
-    for _attempt in range(2):  # one retry on no reply
+    # One retry on no reply. With the real relay "no reply" usually arrives as
+    # its explicit {"error": "target timeout"} at 5 s, not as a client None.
+    for _attempt in range(2):
         try:
             resp = await mesh.routed_call("render-snapshot", payload,
                                           timeout=protocol.SNAPSHOT_TIMEOUT_S,
                                           device_id=device_id)
         except Exception:
             resp = None
-        if resp is not None:
+        if resp is not None and not protocol.is_route_timeout(resp):
             break
     if (advice := protocol.snapshot_error_advice(resp)):
         return advice

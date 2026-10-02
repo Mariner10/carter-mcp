@@ -192,8 +192,9 @@ async def routed_request(verb: str, payload, on_ok, timeout: float = 5.0) -> str
     timeout / relay-error uniformly). `on_ok(result)` renders a successful reply.
 
     `timeout` is passed straight to the socket request. The relay caps a routed
-    reply at about 5 s, so callers should never ask for more than 5.0; slow
-    verbs use the arm-and-poll pattern (provision-device) instead.
+    reply at `protocol.RELAY_ROUTE_TIMEOUT_S` (5 s; MeshSocket ROUTE_TIMEOUT) and
+    then answers {"error": "target timeout"}, so asking for more than about 5 s
+    buys nothing; slow verbs use the arm-and-poll pattern (provision-device).
     """
     if err := connection_error():
         return err

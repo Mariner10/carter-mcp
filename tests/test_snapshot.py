@@ -146,7 +146,7 @@ def test_tool_returns_image_and_digest(fake_device):
     assert isinstance(img, Image) and img.data == TINY_JPEG
     assert img.to_image_content().mimeType == "image/jpeg"
     assert "battery-ring: cell 56pt, content 91pt, scaled 0.75, CUT" in digest
-    # Capability check precedes the verb; the verb gets the ~10 s timeout.
+    # Capability check precedes the verb; the verb gets the relay-matched timeout.
     assert [c[0] for c in calls] == ["get-device-info", "render-snapshot"]
     assert calls[1][1]["tab"] == "Power" and calls[1][2] == protocol.SNAPSHOT_TIMEOUT_S
 
@@ -230,4 +230,51 @@ def test_tool_probe_exception_is_reported(monkeypatch, fake_device):
     monkeypatch.setattr(mesh, "routed_call", boom)
     out = run(device.snapshot_device())
     assert out.startswith(protocol.DEVICE_NO_ANSWER_ADVICE) and "socket closed" in out
+    assert [c[0] for c in calls] == ["get-device-info"]
+
+
+# ─── Relay routed-reply cap (carter-d3e8) ─────────────────────────────────────
+# MeshSocket's relay answers {"error": "target timeout", "status": "failed"}
+# after ROUTE_TIMEOUT (5 s) instead of letting the requester time out.
+RELAY_TIMEOUT = {"error": "target timeout", "status": "failed"}
+
+
+def test_timeouts_match_relay_cap():
+    assert protocol.RELAY_ROUTE_TIMEOUT_S == 5.0
+    # Never wait meaningfully past the relay's own cutoff.
+    assert protocol.RELAY_ROUTE_TIMEOUT_S <= protocol.SNAPSHOT_TIMEOUT_S <= protocol.RELAY_ROUTE_TIMEOUT_S + 1.0
+    assert protocol.DEVICE_INFO_TIMEOUT_S <= protocol.RELAY_ROUTE_TIMEOUT_S + 1.0
+
+
+def test_relay_timeout_reply_is_a_timeout_not_relay_error():
+    assert protocol.is_route_timeout(RELAY_TIMEOUT)
+    assert protocol.is_route_timeout({"error": "Target Timeout"})
+    assert not protocol.is_route_timeout({"error": "target not found"})
+    assert not protocol.is_route_timeout(None)
+    out = protocol.format_routed_response(RELAY_TIMEOUT, on_ok=lambda r: "ok", verb="get-layout")
+    assert "timeout" in out and "Relay error" not in out
+    assert protocol.snapshot_error_advice(RELAY_TIMEOUT) == protocol.SNAPSHOT_TIMEOUT_ADVICE
+
+
+def test_tool_retries_once_on_relay_timeout_reply(fake_device):
+    calls, replies = fake_device
+    replies["render-snapshot"] = [RELAY_TIMEOUT, SPEC_REPLY]
+    out = run(device.snapshot_device())
+    assert isinstance(out, list)
+    assert [c[0] for c in calls].count("render-snapshot") == 2
+
+
+def test_tool_relay_timeout_twice_gives_timeout_advice(fake_device):
+    calls, replies = fake_device
+    replies["render-snapshot"] = [RELAY_TIMEOUT]
+    out = run(device.snapshot_device())
+    assert out == protocol.SNAPSHOT_TIMEOUT_ADVICE
+    assert [c[0] for c in calls].count("render-snapshot") == 2
+
+
+def test_tool_probe_relay_timeout_skips_verb(fake_device):
+    calls, replies = fake_device
+    replies["get-device-info"] = [RELAY_TIMEOUT]
+    out = run(device.snapshot_device())
+    assert out == protocol.DEVICE_NO_ANSWER_ADVICE
     assert [c[0] for c in calls] == ["get-device-info"]

@@ -33,6 +33,16 @@ Two patterns, both already in production for the existing `list-layouts` / `save
 Each reply SHOULD include `"ok": true`. The MCP treats `null` as a timeout and any object with
 `"error"` (and not `ok`) as a relay/routing error.
 
+**Relay routed-reply cap: 5 s (verified carter-d3e8, 2026-10-01).** The MeshSocket relay
+(`Python/socket_server.py`, `ROUTE_TIMEOUT = 5.0`, a class constant with no env override)
+waits 5 s for the target of a `route_msg`. On expiry MeshSocket >= 0.2.0 replies
+`{"error": "target timeout", "status": "failed"}` (0.1.x replied a null payload). The
+Connect+ gateway (carter-relay `internal/gateway`) only pumps frames and adds no timer, so
+the same 5 s applies to local and Connect+ sessions. The MCP reads "target timeout" as a
+timeout (not "Relay error"), and `protocol.RELAY_ROUTE_TIMEOUT_S` holds the value. A device
+verb that may take longer than ~5 s must reply at once and be polled
+(`provision-device` pattern); raising the cap means a MeshSocket release plus a relay redeploy.
+
 ### `get-current-layout`
 Read the layout currently live on the device.
 
@@ -245,7 +255,7 @@ device advertises each one it answers as `verb.<name>` (optionally `@N`) in the
 carter-ek9). The MCP also accepts `protocolVersion >= 3` as "supports all three".
 When the device info is known and neither applies, the MCP answers at once with
 "update CAR-TER to 1.3 for snapshots" (etc.) instead of waiting out the 5 s relay
-timeout. All three are **studio-socket only** (never in `layoutSocketVerbs`) and
+timeout (see "Relay routed-reply cap" above). All three are **studio-socket only** (never in `layoutSocketVerbs`) and
 reply errors as `{ "ok": false, "error": "<code>", "reason": "…" }`. Shared codes:
 `not-foreground` (phone locked / app backgrounded, answered immediately),
 `studio-not-sealed` (E2EE layout on an unsealed gateway studio socket),
@@ -277,9 +287,12 @@ Reply:
 - MCP tool `snapshot_device(tab, mode, scale)` (K10): reads `get-device-info` first
   and answers "update CAR-TER to 1.3 for snapshots" when the device advertises neither
   `verb.render-snapshot` nor `protocolVersion >= 3`. The probe uses a 5 s timeout; if
-  it gets no reply, the tool stops there without sending the verb, and a relay error reply
-  (`{ok:false, error:"target not found"}`) is treated as unknown rather than too old. It sends with a ~10 s timeout and
-  retries once on no reply; returns the JPEG as an MCP image plus a fit digest (CUT
+  it gets no reply (or the relay's "target timeout"), the tool stops there without sending the verb, and a relay error reply
+  (`{ok:false, error:"target not found"}`) is treated as unknown rather than too old. It sends with a 6 s client timeout
+  (the relay's 5 s cap plus 1 s for its "target timeout" reply to arrive; a 10 s wait bought
+  nothing) and retries once on no reply or "target timeout", so the worst case is about 17 s
+  including the probe. The app must therefore finish capture + encode in under 5 s (lower
+  `scale`/quality first); returns the JPEG as an MCP image plus a fit digest (CUT
   lines, clean count, offscreen/unverified/locked, window size/sizeClass/idiom/tab).
   App error codes (`not-foreground`, `too-large`, `studio-not-sealed`) become one-line
   advice, never the generic "Relay error".

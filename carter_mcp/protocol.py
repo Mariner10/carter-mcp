@@ -19,7 +19,7 @@ def format_routed_response(result, on_ok, verb: str) -> str:
     - {"error": …} → the relay could not route / errored.
     - otherwise    → delegate to on_ok(result).
     """
-    if result is None:
+    if result is None or is_route_timeout(result):
         return f"Device did not respond to '{verb}' (timeout). Make sure it's paired and running."
     if isinstance(result, dict) and "error" in result and not result.get("ok"):
         # App-side studio error codes ({ok:false, error:"not-foreground"}) are
@@ -28,6 +28,21 @@ def format_routed_response(result, on_ok, verb: str) -> str:
             return studio_error_message(result, verb)
         return f"Relay error on '{verb}': {result['error']}"
     return on_ok(result)
+
+
+# The MeshSocket relay (socket_server.py `ROUTE_TIMEOUT`, a fixed class constant,
+# not env-configurable; the Connect+ gateway adds no timer of its own) waits this
+# long for the target of a `route_msg`. On expiry MeshSocket >= 0.2.0 answers the
+# requester `{"error": "target timeout", "status": "failed"}`; 0.1.x answered
+# a null payload. Either way a routed verb can never take longer than this.
+RELAY_ROUTE_TIMEOUT_S = 5.0
+RELAY_TIMEOUT_ERROR = "target timeout"
+
+
+def is_route_timeout(result) -> bool:
+    """True for the relay's explicit "the target never answered" reply."""
+    return (isinstance(result, dict) and not result.get("ok")
+            and str(result.get("error", "")).lower() == RELAY_TIMEOUT_ERROR)
 
 
 def format_summary(summary: dict) -> str:
@@ -581,10 +596,12 @@ def format_snapshot_report(resp) -> str:
     return "\n".join(lines)
 
 
-SNAPSHOT_TIMEOUT_S = 10.0
-# get-device-info is answered by every app version, and the relay caps routed
-# replies at about 5 s, so asking for longer than this buys nothing.
-DEVICE_INFO_TIMEOUT_S = 5.0
+# The relay cuts a routed reply off at RELAY_ROUTE_TIMEOUT_S (5 s) and answers
+# "target timeout", so a longer client wait buys nothing (carter-d3e8). The extra
+# second lets the relay's explicit reply arrive before our own timer fires.
+SNAPSHOT_TIMEOUT_S = RELAY_ROUTE_TIMEOUT_S + 1.0
+# get-device-info is answered by every app version; same relay cap applies.
+DEVICE_INFO_TIMEOUT_S = RELAY_ROUTE_TIMEOUT_S
 DEVICE_NO_ANSWER_ADVICE = (
     "The device did not answer get-device-info, so render-snapshot was not "
     "sent. Wake the phone, open CAR-TER, check the Studio Session is still "
@@ -596,8 +613,10 @@ _SNAPSHOT_ADVICE = {
     "studio-not-sealed": "This layout is E2EE; re-pair with a sealed studio session (E2EE studio pairing) to snapshot it.",
 }
 
-SNAPSHOT_TIMEOUT_ADVICE = ("The device did not answer 'render-snapshot' (timeout, retried once). "
-                           "Make sure the phone is awake with CAR-TER open and still paired.")
+SNAPSHOT_TIMEOUT_ADVICE = ("The device did not answer 'render-snapshot' within the relay's 5 s "
+                           "routed-reply limit (timeout, retried once). Make sure the phone is awake with "
+                           "CAR-TER open and still paired; if it is, lower scale (e.g. scale=0.5) "
+                           "so the capture finishes sooner.")
 
 
 def snapshot_error_advice(resp, device_info=None) -> Optional[str]:
@@ -609,7 +628,7 @@ def snapshot_error_advice(resp, device_info=None) -> Optional[str]:
     can pass `resp=None` to ask "is this device too old?" before sending."""
     if device_supports(device_info, "render-snapshot") is False:
         return too_old_message("render-snapshot")
-    if resp is None:
+    if resp is None or is_route_timeout(resp):
         return SNAPSHOT_TIMEOUT_ADVICE
     if not isinstance(resp, dict):
         return f"Unexpected render-snapshot reply: {resp!r}"
