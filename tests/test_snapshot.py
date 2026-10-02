@@ -190,3 +190,44 @@ def test_tool_rejects_bad_mode(fake_device):
 def test_tool_not_connected(monkeypatch):
     monkeypatch.setattr(mesh, "connection_error", lambda: "Not connected. Call connect first.")
     assert run(device.snapshot_device()) == "Not connected. Call connect first."
+
+
+# ─── review fixes: error-dict info is unknown, unanswered probe stops early ───
+
+@pytest.mark.parametrize("info", [
+    {"ok": False, "error": "target not found"},
+    {"error": "target not found"},
+])
+def test_error_reply_is_unknown_not_too_old(info):
+    assert protocol.device_supports(info, "render-snapshot") is None
+    assert protocol.snapshot_error_advice(SPEC_REPLY, info) is None
+
+
+def test_tool_error_info_still_sends_verb(fake_device):
+    calls, replies = fake_device
+    replies["get-device-info"] = [{"ok": False, "error": "target not found"}]
+    out = run(device.snapshot_device())
+    assert isinstance(out, list)
+    assert "render-snapshot" in [c[0] for c in calls]
+
+
+def test_tool_unanswered_probe_skips_verb(fake_device):
+    calls, replies = fake_device
+    replies["get-device-info"] = [None]
+    out = run(device.snapshot_device())
+    assert out == protocol.DEVICE_NO_ANSWER_ADVICE
+    assert [c[0] for c in calls] == ["get-device-info"]
+    assert calls[0][2] == protocol.DEVICE_INFO_TIMEOUT_S
+
+
+def test_tool_probe_exception_is_reported(monkeypatch, fake_device):
+    calls, _ = fake_device
+
+    async def boom(verb, payload, timeout=5.0, device_id=None):
+        calls.append((verb, payload, timeout, device_id))
+        raise ConnectionError("socket closed")
+
+    monkeypatch.setattr(mesh, "routed_call", boom)
+    out = run(device.snapshot_device())
+    assert out.startswith(protocol.DEVICE_NO_ANSWER_ADVICE) and "socket closed" in out
+    assert [c[0] for c in calls] == ["get-device-info"]

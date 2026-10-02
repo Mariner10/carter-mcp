@@ -276,7 +276,9 @@ Reply:
   device lowers quality/scale.
 - MCP tool `snapshot_device(tab, mode, scale)` (K10): reads `get-device-info` first
   and answers "update CAR-TER to 1.3 for snapshots" when the device advertises neither
-  `verb.render-snapshot` nor `protocolVersion >= 3`; sends with a ~10 s timeout and
+  `verb.render-snapshot` nor `protocolVersion >= 3`. The probe uses a 5 s timeout; if
+  it gets no reply, the tool stops there without sending the verb, and a relay error reply
+  (`{ok:false, error:"target not found"}`) is treated as unknown rather than too old. It sends with a ~10 s timeout and
   retries once on no reply; returns the JPEG as an MCP image plus a fit digest (CUT
   lines, clean count, offscreen/unverified/locked, window size/sizeClass/idiom/tab).
   App error codes (`not-foreground`, `too-large`, `studio-not-sealed`) become one-line

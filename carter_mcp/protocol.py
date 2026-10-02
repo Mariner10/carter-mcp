@@ -421,6 +421,11 @@ def device_supports(info, verb: str) -> Optional[bool]:
     """
     if not isinstance(info, dict) or not info:
         return None
+    # A relay/app error reply ({ok:false, error:"target not found"}) says
+    # nothing about the app's version: unknown, not "too old".
+    if (info.get("ok") is False or "error" in info) and \
+            "features" not in info and "protocolVersion" not in info:
+        return None
     name = _verb_name(verb)
     feats = info.get("features")
     if isinstance(feats, list):
@@ -577,6 +582,13 @@ def format_snapshot_report(resp) -> str:
 
 
 SNAPSHOT_TIMEOUT_S = 10.0
+# get-device-info is answered by every app version, and the relay caps routed
+# replies at about 5 s, so asking for longer than this buys nothing.
+DEVICE_INFO_TIMEOUT_S = 5.0
+DEVICE_NO_ANSWER_ADVICE = (
+    "The device did not answer get-device-info, so render-snapshot was not "
+    "sent. Wake the phone, open CAR-TER, check the Studio Session is still "
+    "paired, then try again.")
 
 _SNAPSHOT_ADVICE = {
     "not-foreground": "Wake the phone and open CAR-TER, then retry the snapshot.",

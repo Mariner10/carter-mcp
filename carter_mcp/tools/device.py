@@ -167,11 +167,16 @@ async def snapshot_device(tab: str = "", mode: str = "window", scale: float = 1)
         return f"Invalid snapshot request: {e}"
     # Capability first: an older app never answers the verb, so say "update"
     # instead of waiting out the timeout.
+    # One bounded probe: a device that can't answer get-device-info won't answer
+    # render-snapshot either, so stop here rather than wait out two 10 s calls.
     try:
-        info = await mesh.routed_call("get-device-info", None, timeout=4.0,
+        info = await mesh.routed_call("get-device-info", None,
+                                      timeout=protocol.DEVICE_INFO_TIMEOUT_S,
                                       device_id=device_id)
-    except Exception:
-        info = None
+    except Exception as e:
+        return f"{protocol.DEVICE_NO_ANSWER_ADVICE} ({type(e).__name__}: {e})"
+    if info is None:
+        return protocol.DEVICE_NO_ANSWER_ADVICE
     if protocol.device_supports(info, "render-snapshot") is False:
         return protocol.snapshot_error_advice(None, info)
     resp = None
