@@ -295,6 +295,42 @@ def website_manifest() -> Optional[dict]:
     return (bundle or {}).get("manifest") if bundle else None
 
 
+#: Layout features an older app ignores SILENTLY (no error, the controls just look
+#: dead), with the first app version that understands them. check_sources names
+#: them when the paired app is older (spec 12-derive-variables §4 "Older app versions").
+SILENT_LAYOUT_FEATURES = (
+    ("derive", "1.3", "the top-level `derive` block and `method: \"derive\"` syncs "
+                      "(values computed on the phone)"),
+)
+#: Appended to any app-side drift: what an out-of-step app drops without a word.
+SILENT_FEATURE_NOTE = ("An older app ignores newer layout features silently — e.g. "
+                       "`derive` computed values: the bound controls just show their "
+                       "defaultValue.")
+
+
+def _version_tuple(v) -> Optional[tuple]:
+    parts = str(v or "").strip().split(".")
+    try:
+        return tuple(int(p) for p in parts if p != "")
+    except ValueError:
+        return None
+
+
+def silent_feature_issues(device_info: Optional[dict]) -> list[str]:
+    """Issues for layout features the paired app is too old to understand."""
+    have = _version_tuple((device_info or {}).get("appVersion"))
+    if not have:
+        return []
+    out = []
+    for name, since, what in SILENT_LAYOUT_FEATURES:
+        if have < _version_tuple(since):
+            out.append(f"Paired app v{device_info['appVersion']} predates `{name}` "
+                       f"(app {since}+): it ignores {what} without any error, so the "
+                       f"bound controls just show their defaultValue. Update the app "
+                       f"before pushing a layout that uses `{name}`.")
+    return out
+
+
 def sources_status(device_info: Optional[dict] = None, refresh: bool = False) -> dict:
     """One structured snapshot of every source + a drift verdict.
 
@@ -359,12 +395,13 @@ def sources_status(device_info: Optional[dict] = None, refresh: bool = False) ->
         if dev_proto is not None and site_proto is not None and dev_proto != site_proto:
             issues.append(f"Paired app speaks protocol v{dev_proto} but the catalog "
                           f"targets v{site_proto} — update the app or expect some "
-                          f"controls to be ignored.")
+                          f"controls to be ignored. {SILENT_FEATURE_NOTE}")
         dev_fp = device_info.get("catalogFingerprint")
         if dev_fp and site_fp and dev_fp != site_fp:
             issues.append("The paired app's control definitions differ from the "
                           "website's — the installed app is a different version "
-                          "than the published docs.")
+                          f"than the published docs. {SILENT_FEATURE_NOTE}")
+        issues.extend(silent_feature_issues(device_info))
 
     status["issues"] = issues
     status["aligned"] = not issues
