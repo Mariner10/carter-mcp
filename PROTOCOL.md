@@ -274,6 +274,13 @@ Reply:
 - `locked` — controls showing the Pro upsell placeholder.
 - Extra error: `too-large` — the frame cannot fit the ~200 KB budget even after the
   device lowers quality/scale.
+- MCP tool `snapshot_device(tab, mode, scale)` (K10): reads `get-device-info` first
+  and answers "update CAR-TER to 1.3 for snapshots" when the device advertises neither
+  `verb.render-snapshot` nor `protocolVersion >= 3`; sends with a ~10 s timeout and
+  retries once on no reply; returns the JPEG as an MCP image plus a fit digest (CUT
+  lines, clean count, offscreen/unverified/locked, window size/sizeClass/idiom/tab).
+  App error codes (`not-foreground`, `too-large`, `studio-not-sealed`) become one-line
+  advice, never the generic "Relay error".
 
 ### `patch-layout`  (studio-only, DRAFT — pending app implementation)
 Apply id-addressed edits to the running layout. Cosmetic-only patches hot-reload

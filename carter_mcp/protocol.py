@@ -22,6 +22,10 @@ def format_routed_response(result, on_ok, verb: str) -> str:
     if result is None:
         return f"Device did not respond to '{verb}' (timeout). Make sure it's paired and running."
     if isinstance(result, dict) and "error" in result and not result.get("ok"):
+        # App-side studio error codes ({ok:false, error:"not-foreground"}) are
+        # device answers, not relay failures: explain them before the generic branch.
+        if result.get("error") in _STUDIO_ERRORS:
+            return studio_error_message(result, verb)
         return f"Relay error on '{verb}': {result['error']}"
     return on_ok(result)
 
@@ -569,6 +573,80 @@ def format_snapshot_report(resp) -> str:
         ids = resp.get(key) or []
         if ids:
             lines.append(f"{label}: {', '.join(ids)}")
+    return "\n".join(lines)
+
+
+SNAPSHOT_TIMEOUT_S = 10.0
+
+_SNAPSHOT_ADVICE = {
+    "not-foreground": "Wake the phone and open CAR-TER, then retry the snapshot.",
+    "too-large": "The snapshot is too large for the relay frame — lower scale/quality (e.g. scale=0.5) and retry.",
+    "studio-not-sealed": "This layout is E2EE; re-pair with a sealed studio session (E2EE studio pairing) to snapshot it.",
+}
+
+SNAPSHOT_TIMEOUT_ADVICE = ("The device did not answer 'render-snapshot' (timeout, retried once). "
+                           "Make sure the phone is awake with CAR-TER open and still paired.")
+
+
+def snapshot_error_advice(resp, device_info=None) -> Optional[str]:
+    """One plain line of advice for a failed snapshot, or None when `resp` is ok.
+
+    `device_info` is the RAW get-device-info reply (with `features`); a device
+    known not to support render-snapshot (protocol < 3, no `verb.render-snapshot`)
+    gets the update line instead of a timeout. Checked first, so the caller
+    can pass `resp=None` to ask "is this device too old?" before sending."""
+    if device_supports(device_info, "render-snapshot") is False:
+        return too_old_message("render-snapshot")
+    if resp is None:
+        return SNAPSHOT_TIMEOUT_ADVICE
+    if not isinstance(resp, dict):
+        return f"Unexpected render-snapshot reply: {resp!r}"
+    if resp.get("ok") is True or "error" not in resp:
+        if resp.get("ok") and extract_snapshot_image(resp) is None:
+            return "The device answered render-snapshot without a decodable JPEG image."
+        return None
+    error = resp.get("error")
+    if error in _SNAPSHOT_ADVICE:
+        return _SNAPSHOT_ADVICE[error]
+    return studio_error_message(resp, "render-snapshot")
+
+
+def format_snapshot_digest(resp) -> str:
+    """Compact fit digest of an ok render-snapshot reply: one line per CUT
+    control, a count of the clean ones, the offscreen/unverified/locked lists,
+    and the capture context (window size, sizeClass, idiom, tab)."""
+    if not isinstance(resp, dict):
+        return f"Unexpected render-snapshot reply: {resp!r}"
+    win = resp.get("window") or {}
+    ctx = [f"Snapshot of **{resp.get('layoutName', '?')}**"]
+    if resp.get("tab"):
+        ctx.append(f"tab {resp['tab']}")
+    if "w" in win and "h" in win:
+        ctx.append(f"window {_num(win['w'])}×{_num(win['h'])}pt")
+    if win.get("sizeClass"):
+        ctx.append(f"sizeClass {win['sizeClass']}")
+    if win.get("idiom"):
+        ctx.append(f"idiom {win['idiom']}")
+    lines = [" · ".join(ctx)]
+    if resp.get("sheetPresented"):
+        lines.append("Note: a sheet/alert was presented; it is not in the capture.")
+    controls = resp.get("controls") or {}
+    fits = {c: f for c, f in controls.items() if isinstance(f, dict)}
+    cut = sorted(c for c, f in fits.items() if f.get("cuts"))
+    clean = len(fits) - len(cut)
+    if fits:
+        for cid in cut:
+            lines.append(format_fit_line(cid, fits[cid]))
+        lines.append(f"{len(cut)} cut, {clean} clean of {len(fits)} visible controls.")
+    else:
+        lines.append("No fit report (report=false or no visible controls).")
+    for key, label in (
+            ("offscreen", "Offscreen (below the fold, not checked)"),
+            ("unverified", "Unverified (map/camera/web pixels may be blank in the capture — do not 'fix' blanks)"),
+            ("locked", "Locked (ProFeatures upsell placeholder, not a bug)")):
+        ids = resp.get(key) or []
+        if ids:
+            lines.append(f"{label}: {', '.join(map(str, ids))}")
     return "\n".join(lines)
 
 

@@ -200,12 +200,27 @@ async def routed_request(verb: str, payload, on_ok, timeout: float = 5.0) -> str
     device_id = await get_device_id()
     if not device_id:
         return no_device_error()
-    result = await state.socket.request("route_msg", {
+    result = await routed_call(verb, payload, timeout=timeout, device_id=device_id)
+    return protocol.format_routed_response(result, on_ok=on_ok, verb=verb)
+
+
+async def routed_call(verb: str, payload, timeout: float = 5.0,
+                      device_id: Optional[str] = None):
+    """Send a routed `verb` to the paired device and return the RAW reply
+    (dict / None on timeout), unformatted. Callers that need the reply's
+    fields (snapshot image, device `features`) use this; `routed_request`
+    is the formatted wrapper. Assumes the caller already checked
+    `connection_error()`; resolves the device when `device_id` is omitted
+    (None reply when nothing is paired)."""
+    if device_id is None:
+        device_id = await get_device_id()
+        if not device_id:
+            return None
+    return await state.socket.request("route_msg", {
         "target_id": device_id,
         "type": verb,
         "payload": payload,
     }, timeout=timeout)
-    return protocol.format_routed_response(result, on_ok=on_ok, verb=verb)
 
 
 async def apply_or_broadcast(layout: dict) -> str:

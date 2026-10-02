@@ -11,6 +11,7 @@ import json
 from typing import Optional
 
 from carterkit.buffer import BufferError
+from mcp.server.fastmcp import Image
 
 from carter_mcp import content, mesh, protocol, sources, state
 from carter_mcp.app import mcp
@@ -139,6 +140,54 @@ async def get_device_info() -> str:
     """
     return await mesh.routed_request("get-device-info", None,
                                      on_ok=protocol.format_device_info)
+
+
+@mcp.tool()
+async def snapshot_device(tab: str = "", mode: str = "window", scale: float = 1):
+    """See what the paired phone actually renders: a JPEG of the current screen
+    plus a per-control fit digest (which controls are CUT — content taller than
+    their cell — and which are offscreen, unverified, or Pro-locked).
+
+    Use it after push_layout to find and fix cut/crushed controls without the
+    user picking up the phone. Needs CAR-TER 1.3+ (the render-snapshot verb).
+
+    Args:
+        tab: Tab title to switch to before capturing. Empty = the current tab.
+        mode: "window" (what is on screen). "full" is not supported yet.
+        scale: Capture scale in (0, 3]; lower it if the reply is too large.
+    """
+    if err := mesh.connection_error():
+        return err
+    device_id = await mesh.get_device_id()
+    if not device_id:
+        return mesh.no_device_error()
+    try:
+        payload = protocol.build_render_snapshot_request(tab or None, mode=mode, scale=scale)
+    except ValueError as e:
+        return f"Invalid snapshot request: {e}"
+    # Capability first: an older app never answers the verb, so say "update"
+    # instead of waiting out the timeout.
+    try:
+        info = await mesh.routed_call("get-device-info", None, timeout=4.0,
+                                      device_id=device_id)
+    except Exception:
+        info = None
+    if protocol.device_supports(info, "render-snapshot") is False:
+        return protocol.snapshot_error_advice(None, info)
+    resp = None
+    for _attempt in range(2):  # one retry on no reply
+        try:
+            resp = await mesh.routed_call("render-snapshot", payload,
+                                          timeout=protocol.SNAPSHOT_TIMEOUT_S,
+                                          device_id=device_id)
+        except Exception:
+            resp = None
+        if resp is not None:
+            break
+    if (advice := protocol.snapshot_error_advice(resp)):
+        return advice
+    image = protocol.extract_snapshot_image(resp)
+    return [Image(data=image, format="jpeg"), protocol.format_snapshot_digest(resp)]
 
 
 @mcp.tool()
